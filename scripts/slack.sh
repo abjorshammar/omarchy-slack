@@ -216,7 +216,7 @@ resolve_users() {
     [[ -z "$name" ]] && continue
     cache="$(jq -c --arg id "$uid" --arg n "$name" '.[$id] = $n' <<<"$cache")"
   done <<<"$missing"
-  printf '%s' "$cache" > "$USERS_CACHE.tmp" && mv "$USERS_CACHE.tmp" "$USERS_CACHE"
+  printf '%s' "$cache" > "$USERS_CACHE.tmp.$$" && mv "$USERS_CACHE.tmp.$$" "$USERS_CACHE"
   printf '%s' "$cache"
 }
 
@@ -349,7 +349,7 @@ cmd_history() {
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
   users="$(resolve_users "$uids")"
   out="$(jq -cn --argjson m "$msgs" --argjson u "$users" '{ok:true, messages:$m, users:$u}')"
-  printf '%s' "$out" > "$cache_file.tmp" && mv "$cache_file.tmp" "$cache_file"
+  printf '%s' "$out" > "$cache_file.tmp.$$" && mv "$cache_file.tmp.$$" "$cache_file"
   printf '%s\n' "$out"
 }
 
@@ -394,7 +394,7 @@ cmd_seen() {
   seen="$(jq -c --arg id "$id" --arg ts "$ts" \
     '.[$id] = (if (.[$id] // "0" | tonumber) > ($ts | tonumber) then .[$id] else $ts end)
      | to_entries | sort_by(.value | tonumber) | .[-300:] | from_entries' <<<"$seen")"
-  printf '%s' "$seen" > "$SEEN_FILE.tmp" && mv "$SEEN_FILE.tmp" "$SEEN_FILE"
+  printf '%s' "$seen" > "$SEEN_FILE.tmp.$$" && mv "$SEEN_FILE.tmp.$$" "$SEEN_FILE"
 
   local res marked=false
   res="$(api_call conversations.mark -X POST \

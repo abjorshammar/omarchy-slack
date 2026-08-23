@@ -266,13 +266,63 @@ function firstUrl(text) {
   return m ? m[0] : ""
 }
 
+function htmlEscape(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+}
+
+// Slack mrkdwn → a SAFE Text.StyledText string. Security: the message body is
+// fully HTML-escaped first, and only a fixed whitelist of tags this function
+// itself emits (<b> <i> <s> <font> <br>) is ever present — no <img>, no
+// <a href>, nothing that could load a remote resource. So it cannot fetch
+// anything, unlike raw RichText/AutoText.
+function mrkdwnToStyled(text, users) {
+  var t = String(text || "")
+  // 1) Resolve Slack link/mention constructs to plain text first (they carry
+  //    the only legitimate angle brackets).
+  t = t.replace(/<@([UW][A-Z0-9]{2,30})(\|[^>]*)?>/g, function(m, id, label) {
+    return "@" + (userName(users, id) || (label ? label.slice(1) : id))
+  })
+  t = t.replace(/<#[A-Z0-9]+\|([^>]*)>/g, "#$1")
+  t = t.replace(/<#([A-Z0-9]+)>/g, "#$1")
+  t = t.replace(/<!(here|channel|everyone)(\|[^>]*)?>/g, "@$1")
+  t = t.replace(/<((?:https?|mailto):[^>|]*)\|([^>]+)>/g, "$2")
+  t = t.replace(/<((?:https?|mailto):[^>]*)>/g, "$1")
+  // 2) Turn Slack's escaped entities back into real characters…
+  t = t.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
+  // 3) …then HTML-escape everything, so any user angle bracket is inert.
+  t = htmlEscape(t)
+  // 4) Apply mrkdwn on the escaped text (code first so * _ inside code aren't
+  //    treated as emphasis).
+  t = t.replace(/```([\s\S]+?)```/g, function(m, c) { return '<font face="monospace">' + c + '</font>' })
+  t = t.replace(/`([^`\n]+?)`/g, '<font face="monospace">$1</font>')
+  t = t.replace(/(^|[\s(>])\*([^*\n]+?)\*(?=[\s).,!?:;]|$)/g, '$1<b>$2</b>')
+  t = t.replace(/(^|[\s(>])_([^_\n]+?)_(?=[\s).,!?:;]|$)/g, '$1<i>$2</i>')
+  t = t.replace(/(^|[\s(>])~([^~\n]+?)~(?=[\s).,!?:;]|$)/g, '$1<s>$2</s>')
+  t = t.replace(/\n/g, "<br>")
+  // 5) Emoji shortcodes → unicode (plain text, no tags).
+  t = emojify(t)
+  // Defensive: no <img>/<a>/src should ever exist, but strip any just in case.
+  t = t.replace(/<\s*\/?\s*(img|a|script|iframe)\b[^>]*>/gi, "")
+  return t
+}
+
 // One history payload → display rows.
-function buildMessages(payload, selfId) {
+function buildMessages(payload, selfId, boundaryTs) {
   var msgs = (payload && payload.messages) || []
   var users = (payload && payload.users) || {}
   var out = []
   var prevUser = null
   var prevDay = ""
+  // First-unread marker: the first message newer than the last-read boundary,
+  // used to draw the "new messages" divider. Only when a boundary is known
+  // and something newer exists.
+  var boundary = parseFloat(boundaryTs || "")
+  var firstUnreadIdx = -1
+  if (!isNaN(boundary) && boundary > 0) {
+    for (var b = 0; b < msgs.length; b++) {
+      if (parseFloat(msgs[b].ts || "0") > boundary) { firstUnreadIdx = b; break }
+    }
+  }
   for (var i = 0; i < msgs.length; i++) {
     var m = msgs[i]
     var uid = String(m.user || "")
@@ -296,12 +346,14 @@ function buildMessages(payload, selfId) {
       system: String(m.subtype || "") !== "" && String(m.subtype || "") !== "bot_message",
       grouped: grouped,
       daySep: daySep,
+      firstUnread: i === firstUnreadIdx,
       reactions: reactions,
       replyCount: parseInt(m.reply_count, 10) || 0,
       threadTs: String(m.thread_ts || ""),
       time: msgTime(m.ts),
       url: firstUrl(text),
-      text: text
+      text: text,
+      rich: mrkdwnToStyled(m.text, users)
     })
     prevUser = uid
     prevDay = dk
@@ -380,6 +432,7 @@ if (typeof module !== "undefined") {
     kindGlyph: kindGlyph,
     displayName: displayName,
     formatMessage: formatMessage,
+    mrkdwnToStyled: mrkdwnToStyled,
     emojify: emojify,
     validAvatar: validAvatar,
     avatarSource: avatarSource,

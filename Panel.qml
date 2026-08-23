@@ -64,6 +64,9 @@ Item {
 
   property var convo: null
   property var messages: []
+  // Last-read ts captured when the conversation is opened, so the "new
+  // messages" divider stays put even after we mark it read on open.
+  property string unreadBoundaryTs: ""
   property string historyNote: ""
   property string historyError: ""
   property bool historyLoading: false
@@ -164,7 +167,7 @@ Item {
     historyNote = data.ratelimited
       ? "rate limited — showing cached messages"
       : (data.cached ? "cached · Slack allows one refresh per minute" : "")
-    messages = Model.buildMessages(data, selfId)
+    messages = Model.buildMessages(data, selfId, unreadBoundaryTs)
     var ts = Model.lastTs(data)
     if (convo && ts !== "") markSeen(convo.id, ts)
     scrollToBottom()
@@ -272,6 +275,8 @@ Item {
   function openConvo(c) {
     settingsMode = false
     convo = { id: c.id, name: Model.displayName(c), kind: c.kind }
+    // Snapshot the read boundary before markSeen (on load) advances it.
+    unreadBoundaryTs = seenMap[c.id] ? String(seenMap[c.id]) : ""
     selectedMsg = -1
     threadTs = ""
     threadMessages = []
@@ -1668,7 +1673,9 @@ Item {
                   width: messageList.width
                   readonly property bool hasDay: md.modelData.daySep !== ""
                   readonly property real dayH: hasDay ? Style.space(26) : 0
-                  implicitHeight: dayH + mrow.implicitHeight + Style.space(6)
+                  readonly property bool isFirstUnread: md.modelData.firstUnread === true
+                  readonly property real unreadH: isFirstUnread ? Style.space(22) : 0
+                  implicitHeight: dayH + unreadH + mrow.implicitHeight + Style.space(6)
                   height: implicitHeight
                   readonly property bool selected: root.selectedMsg === index
 
@@ -1719,10 +1726,51 @@ Item {
                     }
                   }
 
+                  // "new messages" divider — a red rule + label at the first
+                  // message that arrived after the last time this was read.
+                  Item {
+                    id: unreadDivider
+                    visible: md.isFirstUnread
+                    height: md.unreadH
+                    anchors.top: daySepItem.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+
+                    Rectangle {
+                      anchors.verticalCenter: parent.verticalCenter
+                      anchors.left: parent.left
+                      anchors.right: newPill.left
+                      anchors.rightMargin: Style.space(8)
+                      anchors.leftMargin: Style.space(6)
+                      height: 1
+                      color: Qt.rgba(Color.urgent.r, Color.urgent.g, Color.urgent.b, 0.6)
+                    }
+                    Rectangle {
+                      id: newPill
+                      anchors.right: parent.right
+                      anchors.rightMargin: Style.space(6)
+                      anchors.verticalCenter: parent.verticalCenter
+                      width: newText.implicitWidth + Style.space(12)
+                      height: newText.implicitHeight + Style.space(4)
+                      radius: height / 2
+                      color: Color.urgent
+                      Text {
+                        id: newText
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: "new messages"
+                        color: Color.background
+                        font.family: root.fontFamily
+                        font.pixelSize: Math.max(8, Style.font.caption - 1)
+                        font.bold: true
+                      }
+                    }
+                  }
+
                   Rectangle {
                     anchors.left: parent.left
                     anchors.right: parent.right
-                    anchors.top: daySepItem.bottom
+                    anchors.top: unreadDivider.bottom
                     anchors.bottom: parent.bottom
                     anchors.rightMargin: Style.space(2)
                     radius: root.cornerRadius
@@ -1734,7 +1782,7 @@ Item {
                     id: mrow
                     anchors.left: parent.left
                     anchors.right: parent.right
-                    anchors.top: daySepItem.bottom
+                    anchors.top: unreadDivider.bottom
                     anchors.leftMargin: Style.space(6)
                     anchors.rightMargin: Style.space(6)
                     anchors.topMargin: Style.space(3)
@@ -1803,14 +1851,18 @@ Item {
                       }
 
                       Text {
-                        textFormat: Text.PlainText
+                        // StyledText renders our safe mrkdwn subset (bold /
+                        // italic / strike / code). The source is fully escaped
+                        // in Model.mrkdwnToStyled, so nothing can be fetched.
+                        textFormat: Text.StyledText
                         width: parent.width
-                        text: md.modelData.text
+                        text: md.modelData.rich
                         color: md.modelData.system ? root.dim : root.foreground
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall
                         font.italic: md.modelData.system === true
                         wrapMode: Text.Wrap
+                        onLinkActivated: function(link) { root.openUrl(link) }
                       }
 
                       // Inline "open link" affordance when the message has a URL.
@@ -1939,7 +1991,7 @@ Item {
                     width: Style.space(20)
                     height: Style.space(20)
                     radius: Math.min(4, Style.cornerRadius)
-                    anchors.top: daySepItem.bottom
+                    anchors.top: unreadDivider.bottom
                     anchors.right: parent.right
                     anchors.rightMargin: Style.space(4)
                     anchors.topMargin: Style.space(2)

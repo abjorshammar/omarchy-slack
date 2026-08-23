@@ -185,15 +185,24 @@ out="$(run login)"
 check "login without app creds errors cleanly" "$(jq -r '.error' <<<"$out")" "not configured"
 
 mkdir -p "$XDG_CONFIG_HOME/omarchy-slack"
+# proxy model: client_id + proxy_url, NO secret anywhere
 cat > "$XDG_CONFIG_HOME/omarchy-slack/oauth.json" <<'EOF'
-{"client_id":"111.222","client_secret":"testsecret","port":41879,"redirect":"https://example.github.io/oauth.html"}
+{"client_id":"111.222","proxy_url":"https://omarchy-slack-oauth.example.workers.dev","port":41879}
 EOF
 out="$(run login-available)"
-check "login available with user override creds" "$(jq -r '.available' <<<"$out")" "true"
+check "login available with client_id + proxy_url" "$(jq -r '.available' <<<"$out")" "true"
+# a config with no proxy_url must NOT enable the button
+cat > "$XDG_CONFIG_HOME/omarchy-slack/oauth.json" <<'EOF'
+{"client_id":"111.222","proxy_url":"","port":41879}
+EOF
+out="$(run login-available)"
+check "login unavailable without proxy_url" "$(jq -r '.available' <<<"$out")" "false"
+# a config carrying a secret is not how it ships — ensure the repo config has none
+check "shipped config ships no secret" "$(jq -r 'has("client_secret")' "$HERE/../config/oauth.json")" "false"
 rm -f "$XDG_CONFIG_HOME/omarchy-slack/oauth.json"
 
-# The loopback listener, driven directly: right state wins, wrong state is
-# refused, browser opener is stubbed out via PATH.
+# The loopback listener in PROXY mode: it waits for ?token=…&state=…, refuses
+# wrong state, and prints the token. Browser opener stubbed via PATH.
 cat > "$STUB_BIN/xdg-open" <<'STUB'
 #!/bin/bash
 exit 0
@@ -201,16 +210,17 @@ STUB
 chmod +x "$STUB_BIN/xdg-open"
 STATE="0123456789abcdef0123456789abcdef"
 PORT=41911
-python3 "$HERE/../scripts/oauth-callback.py" "$PORT" "$STATE" "https://slack.com/oauth/v2/authorize?x=1" > "$WORK/oauth-out" &
+TOK="xoxp-9999999999-proxytesttoken"
+python3 "$HERE/../scripts/oauth-callback.py" "$PORT" "$STATE" "https://slack.com/oauth/v2/authorize?x=1" --expect token > "$WORK/oauth-out" &
 PYPID=$!
 sleep 0.7
-codewrong="$(/usr/bin/curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/callback?code=abc123def456&state=wrongstate")"
+codewrong="$(/usr/bin/curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/callback?token=$TOK&state=wrongstate")"
 check "listener refuses wrong state" "$codewrong" "403"
-codeok="$(/usr/bin/curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/callback?code=abc123def456&state=$STATE")"
+codeok="$(/usr/bin/curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/callback?token=$TOK&state=$STATE")"
 check "listener accepts matching state" "$codeok" "200"
 wait "$PYPID"
-check "listener exits 0 after code" "$?" "0"
-check "listener prints the code" "$(cat "$WORK/oauth-out")" "abc123def456"
+check "listener exits 0 after token" "$?" "0"
+check "listener prints the token" "$(cat "$WORK/oauth-out")" "$TOK"
 
 echo "== status + sign out"
 out="$(run status)"

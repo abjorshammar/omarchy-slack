@@ -92,13 +92,15 @@ clear_token() {
 
 # -------------------------------------------------------------- OAuth login
 
-# App credentials: the user's own override wins, else the ones shipped with
-# the plugin. (Shipping a client secret with a native app is the standard
-# trade-off for browser sign-in — see README, "Privacy & security".)
+# App config for browser sign-in: the user's own override wins, else the
+# config shipped with the plugin. Only a client id and the OAuth proxy URL are
+# needed here — the client secret lives ONLY in the proxy (see oauth-proxy/),
+# never in this repo, so a public checkout carries no secret.
 oauth_config() {
   local f
   for f in "$CONFIG_DIR/oauth.json" "$SCRIPT_DIR/../config/oauth.json"; do
-    if [[ -s "$f" ]] && jq -e '.client_id // "" | length > 0' "$f" >/dev/null 2>&1; then
+    if [[ -s "$f" ]] \
+      && jq -e '(.client_id // "" | length > 0) and (.proxy_url // "" | test("^https://"))' "$f" >/dev/null 2>&1; then
       jq -c . "$f" 2>/dev/null && return 0
     fi
   done
@@ -108,65 +110,52 @@ oauth_config() {
 OAUTH_SCOPES="channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,chat:write,users:read,dnd:read,dnd:write,users:write"
 
 cmd_login() {
-  local cfg cid secret port bounce
+  local cfg cid proxy port
   cfg="$(oauth_config)" || emit_error "not configured"
   cid="$(jq -r '.client_id // ""' <<<"$cfg")"
-  secret="$(jq -r '.client_secret // ""' <<<"$cfg")"
+  proxy="$(jq -r '.proxy_url // "" | rtrimstr("/")' <<<"$cfg")"
   port="$(jq -r '.port // 41879' <<<"$cfg")"
-  bounce="$(jq -r '.redirect // ""' <<<"$cfg")"
   [[ "$cid" =~ ^[0-9]+\.[0-9]+$ ]] || emit_error "not configured"
-  [[ -n "$secret" ]] || emit_error "not configured"
+  [[ "$proxy" =~ ^https://[A-Za-z0-9._-]+(/[A-Za-z0-9._/-]*)?$ ]] || emit_error "bad proxy url"
   [[ "$port" =~ ^[0-9]{4,5}$ ]] || emit_error "bad oauth port"
-  [[ "$bounce" =~ ^https:// ]] || emit_error "bad redirect url"
 
-  local state
-  state="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
-  [[ "$state" =~ ^[0-9a-f]{32}$ ]] || emit_error "could not generate state"
+  # state = <nonce>.<port>, round-tripped through Slack and the proxy so the
+  # proxy knows which local listener to hand the token back to.
+  local nonce state
+  nonce="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+  [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || emit_error "could not generate state"
+  state="$nonce.$port"
 
-  local auth_url
-  auth_url="https://slack.com/oauth/v2/authorize?client_id=$cid&user_scope=$(jq -rn --arg s "$OAUTH_SCOPES" '$s|@uri')&state=$state&redirect_uri=$(jq -rn --arg u "$bounce" '$u|@uri')"
+  # The redirect_uri is the proxy's /callback; the proxy does the secret-bearing
+  # token exchange and 302s the token to our loopback listener.
+  local redirect auth_url
+  redirect="$proxy/callback"
+  auth_url="https://slack.com/oauth/v2/authorize?client_id=$cid&user_scope=$(jq -rn --arg s "$OAUTH_SCOPES" '$s|@uri')&state=$(jq -rn --arg s "$state" '$s|@uri')&redirect_uri=$(jq -rn --arg u "$redirect" '$u|@uri')"
 
-  # The listener binds first, then opens the browser itself — no race. It
-  # prints the authorization code on success and nothing else.
-  local tmp pypid rc code
-  tmp="$CACHE_DIR/.oauth-code.$$"
-  : > "$tmp" || emit_error "cannot write cache dir"   # 0600 under umask 077, before the listener starts
-  python3 "$SCRIPT_DIR/oauth-callback.py" "$port" "$state" "$auth_url" > "$tmp" 2>/dev/null &
+  # Listener binds first (no race), then opens the browser. In proxy mode it
+  # waits for ?token=…&state=<nonce> and prints the token, nothing else.
+  local tmp pypid rc token
+  tmp="$CACHE_DIR/.oauth-token.$$"
+  : > "$tmp" || emit_error "cannot write cache dir"   # 0600 under umask 077
+  python3 "$SCRIPT_DIR/oauth-callback.py" "$port" "$nonce" "$auth_url" --expect token > "$tmp" 2>/dev/null &
   pypid=$!
   trap 'kill "$pypid" 2>/dev/null; rm -f "$tmp"' EXIT TERM INT
   wait "$pypid"
   rc=$?
-  code="$(head -c 600 "$tmp" 2>/dev/null | tr -d '[:space:]')"
+  token="$(head -c 600 "$tmp" 2>/dev/null | tr -d '[:space:]')"
   rm -f "$tmp"
   trap - EXIT TERM INT
-  if (( rc != 0 )) || [[ -z "$code" ]]; then
+  if (( rc != 0 )) || [[ -z "$token" ]]; then
     (( rc == 2 )) && emit_error "port busy — is another sign-in already running?"
     emit_error "sign-in timed out or was cancelled"
   fi
-  [[ "$code" =~ ^[A-Za-z0-9._-]{8,600}$ ]] || emit_error "bad authorization code"
-
-  # Exchange over stdin so the client secret never touches argv.
-  local body res
-  body="$(jq -rn --arg cid "$cid" --arg sec "$secret" --arg code "$code" --arg ru "$bounce" \
-    '"client_id=\($cid|@uri)&client_secret=\($sec|@uri)&code=\($code|@uri)&redirect_uri=\($ru|@uri)"')"
-  res="$("${CURL[@]}" --max-time 20 -X POST \
-    -H 'Content-Type: application/x-www-form-urlencoded' \
-    --data @- "$API/oauth.v2.access" <<<"$body" | head -c "$MAX_BYTES")" \
-    || emit_error "network error talking to slack.com"
-  if ! jq -e '.ok == true' <<<"$res" >/dev/null 2>&1; then
-    jq -c '{ok:false, error:(.error // "sign-in failed")}' <<<"$res" 2>/dev/null || emit_error "sign-in failed"
-    exit 0
-  fi
-
-  local t
-  t="$(jq -r '.authed_user.access_token // ""' <<<"$res")"
-  [[ "$t" =~ ^xoxp-[A-Za-z0-9-]{10,200}$ ]] || emit_error "Slack did not return a user token"
-  store_raw_token "$t"
-  TOKEN="$t"
+  [[ "$token" =~ ^xoxp-[A-Za-z0-9-]{10,200}$ ]] || emit_error "sign-in did not return a valid token"
+  store_raw_token "$token"
+  TOKEN="$token"
   confirm_token
 }
 
-# Whether browser sign-in is available (app credentials present).
+# Whether browser sign-in is available (client id + proxy url configured).
 cmd_login_available() {
   if oauth_config >/dev/null; then jq -cn '{ok:true, available:true}'
   else jq -cn '{ok:true, available:false}'; fi

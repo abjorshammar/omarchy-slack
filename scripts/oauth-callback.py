@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """One-shot OAuth loopback listener for the bottelet.slack Omarchy plugin.
 
-Usage: oauth-callback.py <port> <state> <authorize-url>
+Usage: oauth-callback.py <port> <state> <authorize-url> [--expect code|token]
 
 Binds 127.0.0.1:<port> first, then opens <authorize-url> in the browser.
-Waits up to 240 seconds for GET /callback?code=...&state=... where state
-matches exactly; prints the code to stdout and exits 0. Anything else gets a
-polite error page and the wait continues. Exit codes: 1 timeout/usage,
+Waits up to 240 seconds for GET /callback?<field>=...&state=... where state
+matches exactly and <field> is the expected parameter (`code` by default, or
+`token` in proxy mode). Prints that value to stdout and exits 0. Anything else
+gets a polite error page and the wait continues. Exit codes: 1 timeout/usage,
 2 port already in use.
 
 stdlib only — no third-party imports, binds loopback only, serves no files.
@@ -29,14 +30,25 @@ main{max-width:32rem;padding:2rem;border:1px solid GrayText;border-radius:.5rem}
 
 
 def main() -> int:
-    if len(sys.argv) != 4:
+    args = sys.argv[1:]
+    expect = "code"
+    if "--expect" in args:
+        i = args.index("--expect")
+        try:
+            expect = args[i + 1]
+        except IndexError:
+            return 1
+        del args[i:i + 2]
+    if expect not in ("code", "token"):
+        return 1
+    if len(args) != 3:
         return 1
     try:
-        port = int(sys.argv[1])
+        port = int(args[0])
     except ValueError:
         return 1
-    state = sys.argv[2]
-    auth_url = sys.argv[3]
+    state = args[1]
+    auth_url = args[2]
     if not (1024 <= port <= 65535):
         return 1
     if not re.fullmatch(r"[0-9a-f]{32}", state):
@@ -61,17 +73,17 @@ def main() -> int:
                 return
             q = urllib.parse.parse_qs(parsed.query)
             got_state = q.get("state", [""])[0]
-            code = q.get("code", [""])[0]
+            value = q.get(expect, [""])[0]
             err = q.get("error", [""])[0]
             if err:
                 result["done"] = True
                 self.reply(200, "Sign-in cancelled", "You can close this tab and return to Omarchy.")
                 return
-            if got_state != state or not code:
+            if got_state != state or not value:
                 # Wrong/missing state: refuse, keep waiting for the real one.
                 self.reply(403, "Sign-in rejected", "State mismatch — please retry from Omarchy Slack.")
                 return
-            result["code"] = code
+            result["value"] = value
             result["done"] = True
             self.reply(200, "Signed in", "You can close this tab and return to Omarchy Slack.")
 
@@ -107,8 +119,8 @@ def main() -> int:
         server.handle_request()
     server.server_close()
 
-    if result.get("code"):
-        print(result["code"])
+    if result.get("value"):
+        print(result["value"])
         return 0
     return 1
 

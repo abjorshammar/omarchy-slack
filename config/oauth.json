@@ -1,7 +1,6 @@
 {
-  "_comment": "Slack app credentials for browser sign-in. A native app ships its client credentials (same trade-off as GitHub CLI and friends); scopes are user-level and the token is issued only to whoever completes the browser consent. Override with ~/.config/omarchy-slack/oauth.json to use your own Slack app.",
-  "client_id": "",
-  "client_secret": "",
-  "port": 41879,
-  "redirect": "https://bottelet.github.io/omarchy-slack/oauth.html"
+  "_comment": "Browser sign-in config. No client secret lives here or anywhere in this repo — the secret is held only by the OAuth proxy (see oauth-proxy/). After deploying the proxy, set proxy_url to your Worker URL (e.g. https://omarchy-slack-oauth.<subdomain>.workers.dev). The 'Sign in with Slack' button appears once proxy_url is set. Users can override this file at ~/.config/omarchy-slack/oauth.json to point at their own app + proxy.",
+  "client_id": "11915798015376.11891122664404",
+  "proxy_url": "",
+  "port": 41879
 }

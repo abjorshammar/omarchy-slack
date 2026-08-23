@@ -1,0 +1,8 @@
+name = "omarchy-slack-oauth"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+workers_dev = true
+
+# Secrets are NOT set here — set them out-of-band so they never touch the repo:
+#   wrangler secret put SLACK_CLIENT_ID
+#   wrangler secret put SLACK_CLIENT_SECRET

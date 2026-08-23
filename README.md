@@ -60,18 +60,23 @@ windowrulev2 = center, title:^(Omarchy Slack)$
 
 ## How sign-in works (and the paste-a-token fallback)
 
-The browser flow is standard Slack OAuth: the plugin starts a listener on
-`127.0.0.1`, opens `slack.com`'s consent page, and Slack hands back a
-short-lived authorization code via an HTTPS redirect page (Slack requires
-HTTPS redirects, so a static bounce page on GitHub Pages forwards the code to
-your local listener — it stores nothing and talks to no one else). The code
-is exchanged for your user token, which is stored in the GNOME keyring.
+Slack, unlike Spotify, has no PKCE and requires an HTTPS redirect, so a public
+client can't finish OAuth entirely on its own. The browser flow works like
+this: the plugin starts a listener on `127.0.0.1`, opens Slack's consent page,
+and you pick any workspace. Slack redirects to a small **OAuth proxy** (a
+stateless Cloudflare Worker that holds only the client secret — see
+`oauth-proxy/`), which performs the `code → token` exchange and hands the
+token straight back to your local listener over loopback. The token is stored
+in your GNOME keyring; the client secret never lives in this repo.
 
-If you'd rather use your own Slack app — or the browser flow isn't available
-— choose *paste a token instead* and follow `docs/OWN-APP.md` to create a
-personal Slack app and paste its User OAuth Token. You can also drop your own
-app's credentials into `~/.config/omarchy-slack/oauth.json` to get the
-browser flow with your app.
+The "Sign in with Slack" button appears once a `proxy_url` is set in
+`config/oauth.json` (the publisher deploys the Worker once — see
+`oauth-proxy/README.md`).
+
+If you'd rather use your own Slack app — or no proxy is configured — choose
+*paste a token instead* and follow `docs/OWN-APP.md` to create a personal
+Slack app and paste its User OAuth Token. You can also point
+`~/.config/omarchy-slack/oauth.json` at your own app + your own proxy.
 
 ### Optional: sync read state to your other Slack clients
 
@@ -105,11 +110,10 @@ use different (roomier) API methods and poll every 3 minutes by default
   responses are size-capped, every channel id is regex-validated before use,
   and everything Slack returns renders as plain text — no HTML sinks.
 - The OAuth listener binds `127.0.0.1` only, accepts a single
-  state-validated callback, and dies after four minutes. During sign-in the
-  short-lived authorization code passes through the GitHub Pages redirect
-  URL (Slack requires HTTPS redirects); the page strips it from browser
-  history, sends no referrer, and the code is useless without completing
-  the exchange within minutes.
+  state-validated callback, and dies after four minutes. The client secret
+  lives only in the OAuth proxy (a Cloudflare Worker env var), never in this
+  repo; the proxy is stateless and logs nothing. Your token reaches your
+  machine over loopback and goes straight into the keyring.
 - Message caches and read markers live in `~/.cache/omarchy-slack` with
   `0700`/`0600` permissions — private to your user, like the token.
 - Like every native app with browser sign-in (GitHub CLI included), the

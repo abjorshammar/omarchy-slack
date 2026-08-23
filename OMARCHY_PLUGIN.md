@@ -24,10 +24,12 @@ Shared plumbing:
   `seen.json`, and always prints exactly one JSON object.
 - `scripts/oauth-callback.py` — one-shot loopback listener for OAuth
   (stdlib only, binds 127.0.0.1, state-validated, 240 s lifetime).
-- `config/oauth.json` — shipped OAuth client credentials;
+- `config/oauth.json` — client id + `proxy_url` (NO secret ever);
   `~/.config/omarchy-slack/oauth.json` overrides.
-- `docs/oauth.html` — HTTPS bounce page (GitHub Pages) that forwards Slack's
-  `?code&state` to the local listener (Slack requires HTTPS redirect URLs).
+- `oauth-proxy/` — Cloudflare Worker that holds the client secret and does the
+  `code → token` exchange (Slack has no PKCE + requires an HTTPS redirect, so
+  the secret can't live in the plugin). Stateless, logs nothing; 302s the token
+  to the local listener over loopback. Deploy once (`oauth-proxy/README.md`).
 - `tests/run.sh` — offline suite with stub `curl`: routing, validation,
   caching, rate-limit fallback, listener behavior, secrets hygiene.
 

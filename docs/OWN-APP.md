@@ -33,28 +33,29 @@ the browser flow.
 
 ## Browser sign-in with your own app
 
-If you also want the browser flow against your own app:
+If you want the "Sign in with Slack" button against your own app, you also need
+to run the OAuth proxy (Slack requires an HTTPS redirect and has no PKCE, so
+the secret must live server-side — see `oauth-proxy/README.md`). Then:
 
-1. Add a **Redirect URL** on OAuth & Permissions:
-   `https://bottelet.github.io/omarchy-slack/oauth.html`
-   (or host `docs/oauth.html` yourself — any HTTPS page that forwards the
-   query string to `http://127.0.0.1:41879/callback` works).
-2. Write `~/.config/omarchy-slack/oauth.json`:
+1. Deploy the proxy with your app's client id + secret as env vars.
+2. Add the proxy's `/callback` URL as a **Redirect URL** on your app's
+   OAuth & Permissions page, and activate public distribution.
+3. Write `~/.config/omarchy-slack/oauth.json` (no secret — it stays in the
+   proxy):
 
    ```json
    {
      "client_id": "1234567890.1234567890123",
-     "client_secret": "…",
-     "port": 41879,
-     "redirect": "https://bottelet.github.io/omarchy-slack/oauth.html"
+     "proxy_url": "https://your-worker.your-subdomain.workers.dev",
+     "port": 41879
    }
    ```
 
-The user config takes precedence over the plugin's shipped credentials.
+The user config takes precedence over the plugin's shipped config.
 
-Note: the shipped bounce page forwards to port `41879` specifically. If you
-change `port`, you must host your own copy of `docs/oauth.html` with the
-matching port and point `redirect` at it.
+Simpler alternative: skip the proxy entirely and just paste your app's User
+OAuth Token (steps 1–3 at the top of this file). No proxy, no button, but zero
+infrastructure.
 
 ## Optional read-state sync scopes
 

@@ -107,8 +107,15 @@ use different (roomier) API methods and poll every 3 minutes by default
   in-memory header files — they never appear on a command line or in
   `/proc`.
 - All requests go to `slack.com` over HTTPS only (`--proto '=https'`),
-  responses are size-capped, every channel id is regex-validated before use,
-  and everything Slack returns renders as plain text — no HTML sinks.
+  responses are size-capped, and every channel id is regex-validated before
+  use. Names, errors and reactions render as plain text; message bodies render
+  a small, safe mrkdwn subset (bold/italic/strike/code) via `Text.StyledText`
+  where the content is fully HTML-escaped first and only a fixed tag whitelist
+  (`<b> <i> <s> <font> <br>`) is ever emitted — no `<img>`, `<a>`, or `src`,
+  so nothing can fetch a remote resource.
+- Avatars are downloaded only from Slack's own image hosts (no redirects
+  followed), size-capped, checked to be a real raster format, and converted
+  with ImageMagick resource limits before display.
 - The OAuth listener binds `127.0.0.1` only, accepts a single
   state-validated callback, and dies after four minutes. The client secret
   lives only in the OAuth proxy (a Cloudflare Worker env var), never in this

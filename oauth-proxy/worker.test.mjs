@@ -18,11 +18,13 @@ globalThis.fetch = async (url, opts) => {
 const S = 'a'.repeat(32)
 
 let r = await worker.fetch(new Request(`https://w.dev/callback?code=goodcode&state=${S}.41879`), env)
-ok('good exchange returns 302', r.status === 302)
-const loc = r.headers.get('Location') || ''
-ok('redirects to loopback port', loc.startsWith('http://127.0.0.1:41879/callback'))
-ok('forwards the token', loc.includes('token=xoxp-111-abcdefghij'))
-ok('forwards nonce only (not port-state)', loc.includes(`state=${S}`) && !loc.includes('.41879'))
+ok('good exchange returns an HTML page (200)', r.status === 200)
+const doc = await r.text()
+ok('posts to the loopback port', doc.includes('action="http://127.0.0.1:41879/callback"'))
+ok('token is in a form field, not a URL', doc.includes('name="token" value="xoxp-111-abcdefghij"'))
+ok('token never appears in any URL/query', !/[?&]token=/.test(doc))
+ok('forwards nonce only (not port-state)', doc.includes(`name="state" value="${S}"`) && !doc.includes('.41879'))
+ok('auto-submits the form', doc.includes('.submit()'))
 
 r = await worker.fetch(new Request('https://w.dev/callback?code=goodcode&state=notvalid'), env)
 ok('bad state rejected 400', r.status === 400)
@@ -31,7 +33,7 @@ r = await worker.fetch(new Request('https://w.dev/nope'), env)
 ok('wrong path 404', r.status === 404)
 
 r = await worker.fetch(new Request(`https://w.dev/callback?code=xxxxxxxxxx&state=${S}.41879`), env)
-ok('slack error is not a 302', r.status !== 302)
+ok('slack error is not a success page', r.status !== 200)
 
 r = await worker.fetch(new Request(`https://w.dev/callback?code=goodcode&state=${S}.41879`), {})
 ok('missing creds -> 500', r.status === 500)

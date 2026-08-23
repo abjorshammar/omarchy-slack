@@ -215,10 +215,22 @@ cache_avatar() {
   command -v magick >/dev/null 2>&1 || return 1
   mkdir -p "$AVATAR_DIR" 2>/dev/null || return 1
   tmp="$(mktemp "$out.XXXXXX")" || return 1
+  if ! "${CURL[@]}" --max-time 10 "$url" -o "$tmp.src" 2>/dev/null; then
+    rm -f "$tmp" "$tmp.src" 2>/dev/null; return 1
+  fi
+  # Only feed known raster formats to ImageMagick — never SVG/MVG/MSL, which
+  # can trigger delegates/SSRF/file reads. (Belt with the CDN allowlist above.)
+  local mime
+  mime="$(file -b --mime-type "$tmp.src" 2>/dev/null || echo "")"
+  case "$mime" in
+    image/png|image/jpeg|image/gif|image/webp|image/bmp) : ;;
+    *) rm -f "$tmp" "$tmp.src" 2>/dev/null; return 1 ;;
+  esac
   # Force JPEG output (this Qt build decodes jpeg via libqjpeg) regardless of
-  # the source format (Slack serves webp, which Qt can't read).
-  if "${CURL[@]}" --max-time 10 "$url" -o "$tmp.src" 2>/dev/null \
-     && magick "$tmp.src" -resize 72x72^ -gravity center -extent 72x72 "jpg:$tmp" 2>/dev/null; then
+  # source format; resource limits guard against decompression bombs; [0]
+  # reads only the first frame.
+  if magick -limit memory 64MiB -limit disk 128MiB \
+       "$tmp.src[0]" -resize 72x72^ -gravity center -extent 72x72 "jpg:$tmp" 2>/dev/null; then
     mv "$tmp" "$out"; rm -f "$tmp.src"; printf '%s' "$out"; return 0
   fi
   rm -f "$tmp" "$tmp.src" 2>/dev/null; return 1

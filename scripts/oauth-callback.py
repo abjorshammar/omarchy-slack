@@ -66,15 +66,15 @@ def main() -> int:
         # sends a request cannot pin the server (single idle TCP connection
         # would otherwise block handle_one_request forever).
         timeout = 10
-        def do_GET(self):  # noqa: N802 (http.server API)
-            parsed = urllib.parse.urlparse(self.path)
-            if parsed.path != "/callback":
+
+        def _finish(self, path, params):
+            # params: dict of str -> [values] (from query or form body).
+            if path != "/callback":
                 self.reply(404, "Not found", "This server only handles the Slack sign-in callback.")
                 return
-            q = urllib.parse.parse_qs(parsed.query)
-            got_state = q.get("state", [""])[0]
-            value = q.get(expect, [""])[0]
-            err = q.get("error", [""])[0]
+            got_state = params.get("state", [""])[0]
+            value = params.get(expect, [""])[0]
+            err = params.get("error", [""])[0]
             if err:
                 result["done"] = True
                 self.reply(200, "Sign-in cancelled", "You can close this tab and return to Omarchy.")
@@ -86,6 +86,22 @@ def main() -> int:
             result["value"] = value
             result["done"] = True
             self.reply(200, "Signed in", "You can close this tab and return to Omarchy Slack.")
+
+        def do_GET(self):  # noqa: N802 (http.server API)
+            parsed = urllib.parse.urlparse(self.path)
+            self._finish(parsed.path, urllib.parse.parse_qs(parsed.query))
+
+        # The proxy delivers the token via a form POST so it never lands in a
+        # URL/history; read it from the request body.
+        def do_POST(self):  # noqa: N802
+            parsed = urllib.parse.urlparse(self.path)
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                length = 0
+            length = max(0, min(length, 8192))
+            raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+            self._finish(parsed.path, urllib.parse.parse_qs(raw))
 
         def reply(self, status, title, detail):
             body = (PAGE % (title, detail)).encode()

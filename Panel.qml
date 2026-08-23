@@ -331,9 +331,13 @@ Item {
       grouped: false,
       replyCount: 0,
       threadTs: sendProc.intoThread ? threadTs : "",
+      daySep: "",
+      firstUnread: false,
+      reactions: [],
       time: Qt.formatTime(new Date(), "HH:mm"),
-      url: "",
-      text: Model.formatMessage(sendProc.pendingText, {})
+      url: Model.firstUrl(sendProc.pendingText),
+      text: Model.formatMessage(sendProc.pendingText, {}),
+      rich: Model.mrkdwnToStyled(sendProc.pendingText, {})
     }
     if (sendProc.intoThread) {
       var t = threadMessages.slice(); t.push(row); threadMessages = t

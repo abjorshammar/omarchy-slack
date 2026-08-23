@@ -40,6 +40,11 @@ border:1px solid GrayText;border-radius:.5rem}</style>
 <main><h1>${title}</h1><p>${detail}</p></main>`;
 }
 
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 function html(body, status = 200) {
   return new Response(body, {
     status,
@@ -94,7 +99,7 @@ export default {
       });
       const data = await resp.json();
       if (!data.ok) {
-        return html(page("Sign-in failed", "Slack said: " + String(data.error || "unknown error")), 400);
+        return html(page("Sign-in failed", "Slack said: " + esc(data.error || "unknown error")), 400);
       }
       token = (data.authed_user && data.authed_user.access_token) || "";
     } catch (e) {
@@ -105,21 +110,22 @@ export default {
       return html(page("Sign-in failed", "Slack did not return a user token."), 400);
     }
 
-    // Hand the token to the user's local plugin listener over loopback. The
-    // browser performs this redirect locally; Slack never sees this URL, and
-    // the token travels only over 127.0.0.1 on the user's own machine.
-    const loopback =
-      "http://127.0.0.1:" + state.port + "/callback" +
-      "?token=" + encodeURIComponent(token) +
-      "&state=" + encodeURIComponent(state.nonce);
-
-    return new Response(null, {
-      status: 302,
-      headers: {
-        Location: loopback,
-        "Cache-Control": "no-store",
-        "Referrer-Policy": "no-referrer",
-      },
-    });
+    // Hand the token to the user's local plugin listener over loopback via a
+    // form POST — the token travels in the request BODY, never in a URL, so
+    // it is not written to the browser's history (127.0.0.1 is exempt from
+    // mixed-content blocking). Slack never sees this address.
+    const loopback = "http://127.0.0.1:" + state.port + "/callback";
+    const body = `<!doctype html><meta charset="utf-8"><title>Omarchy Slack</title>
+<style>:root{color-scheme:light dark}body{font-family:system-ui;background:Canvas;color:CanvasText;
+display:grid;place-items:center;height:100vh;margin:0}main{max-width:32rem;padding:2rem;
+border:1px solid GrayText;border-radius:.5rem}</style>
+<main><h1>Signed in</h1><p>Returning to Omarchy Slack…</p>
+<p><small>If this tab stays open, it is safe to close.</small></p></main>
+<form id="f" method="POST" action="${esc(loopback)}">
+<input type="hidden" name="token" value="${esc(token)}">
+<input type="hidden" name="state" value="${esc(state.nonce)}">
+</form>
+<script>document.getElementById("f").submit()</script>`;
+    return html(body);
   },
 };

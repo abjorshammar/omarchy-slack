@@ -247,10 +247,12 @@ TOK="xoxp-9999999999-proxytesttoken"
 python3 "$HERE/../scripts/oauth-callback.py" "$PORT" "$STATE" "https://slack.com/oauth/v2/authorize?x=1" --expect token > "$WORK/oauth-out" &
 PYPID=$!
 sleep 0.7
-codewrong="$(/usr/bin/curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/callback?token=$TOK&state=wrongstate")"
-check "listener refuses wrong state" "$codewrong" "403"
-codeok="$(/usr/bin/curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/callback?token=$TOK&state=$STATE")"
-check "listener accepts matching state" "$codeok" "200"
+# The proxy delivers the token via a form POST (body, not URL). Wrong state is
+# refused; the matching POST is accepted and the token printed.
+codewrong="$(/usr/bin/curl -s -o /dev/null -w '%{http_code}' -X POST --data "token=$TOK&state=wrongstate" "http://127.0.0.1:$PORT/callback")"
+check "listener refuses wrong state (POST)" "$codewrong" "403"
+codeok="$(/usr/bin/curl -s -o /dev/null -w '%{http_code}' -X POST --data "token=$TOK&state=$STATE" "http://127.0.0.1:$PORT/callback")"
+check "listener accepts matching state (POST)" "$codeok" "200"
 wait "$PYPID"
 check "listener exits 0 after token" "$?" "0"
 check "listener prints the token" "$(cat "$WORK/oauth-out")" "$TOK"

@@ -179,26 +179,24 @@ out="$(run snooze '60; reboot')"
 check "snooze validates minutes" "$(jq -r '.ok' <<<"$out")" "false"
 
 echo "== oauth login plumbing"
+# The plugin ships a ready client_id + proxy_url, so browser sign-in is
+# available by default (the button shows out of the box).
 out="$(run login-available)"
-check "login unavailable without app creds" "$(jq -r '.available' <<<"$out")" "false"
-out="$(run login)"
-check "login without app creds errors cleanly" "$(jq -r '.error' <<<"$out")" "not configured"
-
-mkdir -p "$XDG_CONFIG_HOME/omarchy-slack"
-# proxy model: client_id + proxy_url, NO secret anywhere
-cat > "$XDG_CONFIG_HOME/omarchy-slack/oauth.json" <<'EOF'
-{"client_id":"111.222","proxy_url":"https://omarchy-slack-oauth.example.workers.dev","port":41879}
-EOF
-out="$(run login-available)"
-check "login available with client_id + proxy_url" "$(jq -r '.available' <<<"$out")" "true"
-# a config with no proxy_url must NOT enable the button
-cat > "$XDG_CONFIG_HOME/omarchy-slack/oauth.json" <<'EOF'
-{"client_id":"111.222","proxy_url":"","port":41879}
-EOF
-out="$(run login-available)"
-check "login unavailable without proxy_url" "$(jq -r '.available' <<<"$out")" "false"
-# a config carrying a secret is not how it ships — ensure the repo config has none
+check "login available by default (ships client_id + proxy_url)" "$(jq -r '.available' <<<"$out")" "true"
+# and the shipped config never contains a secret (it lives only in the proxy)
 check "shipped config ships no secret" "$(jq -r 'has("client_secret")' "$HERE/../config/oauth.json")" "false"
+check "shipped config has an https proxy_url" "$(jq -r '.proxy_url | test("^https://")' "$HERE/../config/oauth.json")" "true"
+
+# oauth_config validation: a user override that is malformed (no https proxy)
+# must not be accepted as-is. Point the shipped fallback away so we test the
+# override in isolation by giving it a bad proxy AND a bad client id.
+mkdir -p "$XDG_CONFIG_HOME/omarchy-slack"
+cat > "$XDG_CONFIG_HOME/omarchy-slack/oauth.json" <<'EOF'
+{"client_id":"111.222","proxy_url":"http://insecure.example","port":41879}
+EOF
+# override is invalid (non-https proxy) -> falls back to the valid shipped config
+out="$(run login-available)"
+check "invalid override falls back to shipped (still available)" "$(jq -r '.available' <<<"$out")" "true"
 rm -f "$XDG_CONFIG_HOME/omarchy-slack/oauth.json"
 
 # The loopback listener in PROXY mode: it waits for ?token=…&state=…, refuses

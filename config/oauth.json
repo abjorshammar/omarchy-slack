@@ -1,0 +1,7 @@
+{
+  "_comment": "Slack app credentials for browser sign-in. A native app ships its client credentials (same trade-off as GitHub CLI and friends); scopes are user-level and the token is issued only to whoever completes the browser consent. Override with ~/.config/omarchy-slack/oauth.json to use your own Slack app.",
+  "client_id": "",
+  "client_secret": "",
+  "port": 41879,
+  "redirect": "https://bottelet.github.io/omarchy-slack/oauth.html"
+}

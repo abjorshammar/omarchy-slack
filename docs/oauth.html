@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Omarchy Slack sign-in</title>
+<style>
+  :root { color-scheme: light dark }
+  body { font-family: system-ui; background: Canvas; color: CanvasText;
+         display: grid; place-items: center; height: 100vh; margin: 0 }
+  main { max-width: 34rem; padding: 2rem; border: 1px solid GrayText; border-radius: .5rem }
+  code { user-select: all; word-break: break-all }
+</style>
+<main>
+  <h1>Finishing Slack sign-in…</h1>
+  <p id="msg">Handing the authorization back to Omarchy Slack on this computer.</p>
+  <p id="fallback" hidden>
+    If nothing happened, Omarchy Slack isn't listening on this machine.
+    Close this tab and press <b>Sign in with Slack</b> again.
+  </p>
+</main>
+<script>
+  // Slack requires an HTTPS redirect URL, so this static page exists only to
+  // bounce the ?code=...&state=... query to the local plugin listener. No
+  // parameters are read, stored, or sent anywhere else.
+  (function () {
+    var q = window.location.search;
+    if (/^\?(?=.*code=)(?=.*state=)[\x20-\x7e]*$/.test(q)) {
+      window.location.replace("http://127.0.0.1:41879/callback" + q);
+      setTimeout(function () {
+        document.getElementById("fallback").hidden = false;
+      }, 2500);
+    } else {
+      document.getElementById("msg").textContent =
+        "This page is only used during Omarchy Slack sign-in.";
+    }
+  })();
+</script>

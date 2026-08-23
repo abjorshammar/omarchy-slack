@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "id": "bottelet.slack",
+  "name": "Omarchy Slack",
+  "version": "1.0.0",
+  "author": "Casper Bottelet",
+  "license": "MIT",
+  "description": "Slack as a fast, themed Omarchy app: sign in with your browser, read and reply to DMs and channels, toggle presence and Do Not Disturb — with a mention badge in your bar. No Chromium, no half-gigabyte client.",
+  "kinds": [
+    "bar-widget",
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "overlay": "Overlay.qml"
+  },
+  "barWidget": {
+    "displayName": "Omarchy Slack",
+    "description": "Slack icon that badges up with unread DMs; click to open the Slack app overlay",
+    "category": "Info",
+    "aliases": [
+      "slack",
+      "chat",
+      "messages"
+    ],
+    "allowMultiple": false,
+    "defaults": {
+      "refreshMinutes": 3
+    },
+    "schema": [
+      {
+        "key": "refreshMinutes",
+        "type": "integer",
+        "label": "Refresh every",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 3,
+        "description": "Minutes between unread-count polls for the bar badge."
+      }
+    ]
+  }
+}

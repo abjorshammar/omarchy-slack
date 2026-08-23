@@ -53,7 +53,7 @@ case "$method" in
       echo '{"ok":true,"channel":{"id":"'"$ch"'","unread_count_display":1,"latest":{"ts":"1755900001.000100"}}}'
     fi ;;
   users.info)
-    echo '{"ok":true,"user":{"id":"U2222222","name":"jane","real_name":"Jane Doe","profile":{"display_name":"jane.d"}}}' ;;
+    echo '{"ok":true,"user":{"id":"U2222222","name":"jane","real_name":"Jane Doe","profile":{"display_name":"jane.d","image_72":"https://ca.slack-edge.com/T1-U2-72.png","image_48":"http://insecure.example/x.png"}}}' ;;
   users.getPresence)
     echo '{"ok":true,"presence":"active"}' ;;
   dnd.info)
@@ -112,6 +112,7 @@ check "team name" "$(jq -r '.team' <<<"$out")" "Acme"
 check "three conversations" "$(jq -r '.conversations | length' <<<"$out")" "3"
 check "dm unread" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .unread' <<<"$out")" "3"
 check "dm name resolved" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .name' <<<"$out")" "jane.d"
+check "dm avatar resolved" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .avatar' <<<"$out")" "https://ca.slack-edge.com/T1-U2-72.png"
 check "channel kind" "$(jq -r '.conversations[] | select(.id=="C0BBBBBB2") | .kind' <<<"$out")" "channel"
 check "presence" "$(jq -r '.presence' <<<"$out")" "active"
 
@@ -128,7 +129,8 @@ out="$(run history D0AAAAAA1)"
 check "history ok" "$(jq -r '.ok' <<<"$out")" "true"
 check "history names its channel" "$(jq -r '.channel' <<<"$out")" "D0AAAAAA1"
 check "chronological order" "$(jq -r '.messages[0].ts' <<<"$out")" "1755900001.000100"
-check "user map present" "$(jq -r '.users.U2222222' <<<"$out")" "jane.d"
+check "user map present (name)" "$(jq -r '.users.U2222222.n' <<<"$out")" "jane.d"
+check "avatar captured from slack-edge" "$(jq -r '.users.U2222222.i' <<<"$out")" "https://ca.slack-edge.com/T1-U2-72.png"
 n_before="$(grep -c conversations.history "$CURL_LOG")"
 out="$(run history D0AAAAAA1)"
 n_after="$(grep -c conversations.history "$CURL_LOG")"

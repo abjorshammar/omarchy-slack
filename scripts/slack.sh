@@ -186,18 +186,26 @@ valid_ts() { [[ "$1" =~ ^[0-9]{1,12}\.[0-9]{1,8}$ ]]; }
 
 # users.json cache: { "U123": "Display Name", ... }. Names are display data
 # only; the QML side renders them PlainText.
+# Cache shape: { "U123": {"n":"Display Name","i":"https://…/image_48"}, … }.
+# Old caches stored a bare name string per id; normalize those to {n:…} on read.
 load_users_cache() {
   if [[ -s "$USERS_CACHE" ]]; then
-    jq -c 'if type == "object" then . else {} end' "$USERS_CACHE" 2>/dev/null || echo '{}'
+    jq -c 'if type == "object"
+             then with_entries(.value |= (if type == "string" then {n: ., i: ""} else . end))
+             else {} end' "$USERS_CACHE" 2>/dev/null || echo '{}'
   else
     echo '{}'
   fi
 }
 
+# Slack avatars come from these hosts only; anything else is dropped so a
+# tampered response can't point an <Image> at an arbitrary URL.
+valid_avatar() { [[ "$1" =~ ^https://(secure\.gravatar\.com|[a-z0-9.-]*\.slack-edge\.com)/ ]]; }
+
 # resolve_users <json array of user ids> — fetches at most MAX_USER_LOOKUPS
 # unknown ids, merges into the cache, prints the full cache object.
 resolve_users() {
-  local ids="$1" cache missing uid info name fetched=0
+  local ids="$1" cache missing uid info name img fetched=0
   cache="$(load_users_cache)"
   missing="$(jq -cr --argjson cache "$cache" '[.[] | select($cache[.] == null)] | unique | .[]' <<<"$ids" 2>/dev/null)"
   while IFS= read -r uid; do
@@ -210,7 +218,9 @@ resolve_users() {
     [[ -z "$name" ]] && name="$(jq -r '.user.real_name // .user.name // ""' <<<"$info" 2>/dev/null)"
     [[ -z "$name" ]] && continue
     name="${name:0:80}"
-    cache="$(jq -c --arg id "$uid" --arg n "$name" '.[$id] = $n' <<<"$cache")"
+    img="$(jq -r '.user.profile.image_72 // .user.profile.image_48 // ""' <<<"$info" 2>/dev/null)"
+    valid_avatar "$img" || img=""
+    cache="$(jq -c --arg id "$uid" --arg n "$name" --arg i "$img" '.[$id] = {n:$n, i:$i}' <<<"$cache")"
   done <<<"$missing"
   # Bound the cache: 80-char names above, 400 entries here.
   cache="$(jq -c 'to_entries | .[-400:] | from_entries' <<<"$cache")"
@@ -303,7 +313,8 @@ cmd_counts() {
       conversations: [$rows[] | {
         id, kind, latest,
         unread: (.unread // 0),
-        name: (if .kind == "im" then ($users[.user] // .user) else .name end),
+        name: (if .kind == "im" then (($users[.user].n) // .user) else .name end),
+        avatar: (if .kind == "im" then (($users[.user].i) // "") else "" end),
         user: (.user // "")
       }]}'
 }

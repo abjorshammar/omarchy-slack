@@ -183,10 +183,55 @@ function displayName(conv) {
 // Slack mrkdwn → plain text. Safe because every rendering Text element uses
 // Text.PlainText; this only makes the content readable, it is not a
 // sanitizer.
+function userName(users, id) {
+  var u = users && users[id]
+  if (!u) return null
+  return typeof u === "string" ? u : (u.n || null)
+}
+
+function userAvatar(users, id) {
+  var u = users && users[id]
+  if (!u || typeof u === "string") return ""
+  return validAvatar(u.i) ? u.i : ""
+}
+
+// Avatars are only ever loaded from Slack's own image hosts.
+function validAvatar(url) {
+  return /^https:\/\/(secure\.gravatar\.com|[a-z0-9.-]*\.slack-edge\.com)\//.test(String(url || ""))
+}
+
+// A small map of the mrkdwn emoji shortcodes that show up most in practice.
+// Unknown :shortcodes: are left as-is (still readable), and Slack already
+// sends most emoji as literal unicode.
+var EMOJI = {
+  ":smile:":"😄",":smiley:":"😃",":grin:":"😁",":laughing:":"😆",":joy:":"😂",
+  ":rofl:":"🤣",":wink:":"😉",":blush:":"😊",":slightly_smiling_face:":"🙂",
+  ":thinking_face:":"🤔",":upside_down_face:":"🙃",":sunglasses:":"😎",
+  ":heart:":"❤️",":yellow_heart:":"💛",":green_heart:":"💚",":blue_heart:":"💙",
+  ":thumbsup:":"👍",":+1:":"👍",":thumbsdown:":"👎",":-1:":"👎",":ok_hand:":"👌",
+  ":clap:":"👏",":raised_hands:":"🙌",":pray:":"🙏",":muscle:":"💪",":wave:":"👋",
+  ":point_up:":"☝️",":point_right:":"👉",":eyes:":"👀",":fire:":"🔥",":tada:":"🎉",
+  ":sparkles:":"✨",":star:":"⭐",":star2:":"🌟",":zap:":"⚡",":boom:":"💥",
+  ":rocket:":"🚀",":100:":"💯",":white_check_mark:":"✅",":heavy_check_mark:":"✔️",
+  ":x:":"❌",":warning:":"⚠️",":bell:":"🔔",":no_bell:":"🔕",":lock:":"🔒",
+  ":bulb:":"💡",":bug:":"🐛",":wrench:":"🔧",":hammer:":"🔨",":memo:":"📝",
+  ":pushpin:":"📌",":calendar:":"📅",":coffee:":"☕",":beer:":"🍺",":pizza:":"🍕",
+  ":smiling_face_with_tear:":"🥲",":sob:":"😭",":cry:":"😢",":angry:":"😠",
+  ":scream:":"😱",":sweat_smile:":"😅",":partying_face:":"🥳",":raised_hand:":"✋",
+  ":point_down:":"👇",":ok:":"🆗",":heavy_plus_sign:":"➕",":recycle:":"♻️",
+  ":question:":"❓",":exclamation:":"❗",":checkered_flag:":"🏁",":dart:":"🎯"
+}
+
+function emojify(text) {
+  return String(text || "").replace(/:[a-z0-9_+-]+:/g, function(code) {
+    return EMOJI[code] || code
+  })
+}
+
 function formatMessage(text, users) {
   var t = String(text || "")
   t = t.replace(/<@([UW][A-Z0-9]{2,30})(\|[^>]*)?>/g, function(m, id, label) {
-    var name = users && users[id] ? users[id] : (label ? label.slice(1) : id)
+    var name = userName(users, id) || (label ? label.slice(1) : id)
     return "@" + name
   })
   t = t.replace(/<#[A-Z0-9]+\|([^>]*)>/g, "#$1")
@@ -195,7 +240,13 @@ function formatMessage(text, users) {
   t = t.replace(/<((?:https?|mailto):[^>|]*)\|([^>]+)>/g, "$2")
   t = t.replace(/<((?:https?|mailto):[^>]*)>/g, "$1")
   t = t.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
-  return t
+  return emojify(t)
+}
+
+// First http(s) URL in a message, for click-to-open. Returns "" if none.
+function firstUrl(text) {
+  var m = String(text || "").match(/https?:\/\/[^\s<>|]+/)
+  return m ? m[0] : ""
 }
 
 // One history payload → display rows.
@@ -203,18 +254,26 @@ function buildMessages(payload, selfId) {
   var msgs = (payload && payload.messages) || []
   var users = (payload && payload.users) || {}
   var out = []
+  var prevUser = null
   for (var i = 0; i < msgs.length; i++) {
     var m = msgs[i]
     var uid = String(m.user || "")
-    var name = users[uid] || String(m.username || "") || (m.bot ? "bot" : uid || "?")
+    var name = userName(users, uid) || String(m.username || "") || (m.bot ? "bot" : uid || "?")
+    var text = formatMessage(m.text, users)
     out.push({
       ts: String(m.ts || ""),
       name: name,
+      avatar: userAvatar(users, uid),
       mine: selfId !== "" && uid === selfId,
       system: String(m.subtype || "") !== "" && String(m.subtype || "") !== "bot_message",
+      // Group consecutive messages from the same author: hide the repeated
+      // name/avatar header on all but the first.
+      grouped: uid !== "" && uid === prevUser,
       time: msgTime(m.ts),
-      text: formatMessage(m.text, users)
+      url: firstUrl(text),
+      text: text
     })
+    prevUser = uid
   }
   return out
 }
@@ -269,6 +328,11 @@ if (typeof module !== "undefined") {
     kindGlyph: kindGlyph,
     displayName: displayName,
     formatMessage: formatMessage,
+    emojify: emojify,
+    validAvatar: validAvatar,
+    userName: userName,
+    userAvatar: userAvatar,
+    firstUrl: firstUrl,
     buildMessages: buildMessages,
     lastTs: lastTs,
     msgTime: msgTime,

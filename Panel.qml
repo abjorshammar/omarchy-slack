@@ -67,6 +67,11 @@ Item {
   property bool settingsMode: false
   property string tokenFeedback: ""
 
+  // Keyboard message selection + a transient copy confirmation.
+  property int selectedMsg: -1
+  property string flash: ""
+  property bool showShortcuts: false
+
   // ------------------------------------------------------ overlay contract
 
   function open(payloadJson) {
@@ -151,9 +156,42 @@ Item {
   }
 
   function scrollToBottom() {
-    Qt.callLater(function() {
-      messageScroll.contentY = Math.max(0, messageScroll.contentHeight - messageScroll.height)
-    })
+    Qt.callLater(function() { messageList.positionViewAtEnd() })
+  }
+
+  Timer { id: flashTimer; interval: 1400; onTriggered: root.flash = "" }
+  function showFlash(msg) { flash = msg; flashTimer.restart() }
+
+  function copyText(t) {
+    if (!t) return
+    Quickshell.execDetached(["wl-copy", "--", String(t)])
+    showFlash("copied")
+  }
+
+  // Only ever hands http(s) URLs to the opener.
+  function openUrl(u) {
+    if (u && /^https?:\/\//i.test(String(u)))
+      Quickshell.execDetached(["xdg-open", String(u)])
+  }
+
+  // Keyboard message selection within the open conversation.
+  function selectMsg(step) {
+    if (!convo || messages.length === 0) return
+    var at = selectedMsg
+    if (at < 0) at = step > 0 ? 0 : messages.length - 1
+    else at = Math.min(messages.length - 1, Math.max(0, at + step))
+    selectedMsg = at
+    Qt.callLater(function() { messageList.positionViewAtIndex(at, ListView.Contain) })
+  }
+
+  function copySelected() {
+    var i = selectedMsg >= 0 ? selectedMsg : messages.length - 1
+    if (i >= 0 && i < messages.length) copyText(messages[i].text)
+  }
+
+  function openSelected() {
+    var i = selectedMsg >= 0 ? selectedMsg : messages.length - 1
+    if (i >= 0 && i < messages.length && messages[i].url) openUrl(messages[i].url)
   }
 
   // Records the read marker (shared with the bar badge via seen.json) and
@@ -170,6 +208,7 @@ Item {
   function openConvo(c) {
     settingsMode = false
     convo = { id: c.id, name: Model.displayName(c), kind: c.kind }
+    selectedMsg = -1
     messages = []
     historyError = ""
     historyNote = ""
@@ -464,8 +503,38 @@ Item {
 
       Keys.priority: Keys.BeforeItem
       Keys.onPressed: function(event) {
+          var inConvo = root.convo !== null && !root.settingsMode
+          if (root.showShortcuts) {
+            root.showShortcuts = false
+            event.accepted = true
+            return
+          }
           if (event.key === Qt.Key_Escape) {
-            root.dismiss()
+            if (inConvo) root.backToList()
+            else root.dismiss()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Question
+                     || (event.key === Qt.Key_Slash && event.modifiers === Qt.ControlModifier)) {
+            root.showShortcuts = true
+            event.accepted = true
+          } else if (event.key === Qt.Key_Slash) {
+            filterField.forceActiveFocus()
+            event.accepted = true
+          } else if (inConvo && (event.key === Qt.Key_J || event.key === Qt.Key_Down)) {
+            root.selectMsg(1)
+            event.accepted = true
+          } else if (inConvo && (event.key === Qt.Key_K || event.key === Qt.Key_Up)) {
+            root.selectMsg(-1)
+            event.accepted = true
+          } else if (inConvo && event.key === Qt.Key_Y) {
+            root.copySelected()
+            event.accepted = true
+          } else if (inConvo && (event.key === Qt.Key_O
+                     || event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
+            root.openSelected()
+            event.accepted = true
+          } else if (inConvo && event.key === Qt.Key_I) {
+            composeField.forceActiveFocus()
             event.accepted = true
           } else if (event.key === Qt.Key_Down
                      || (event.key === Qt.Key_J && event.modifiers === Qt.ControlModifier)) {
@@ -474,9 +543,6 @@ Item {
           } else if (event.key === Qt.Key_Up
                      || (event.key === Qt.Key_K && event.modifiers === Qt.ControlModifier)) {
             root.selectStep(-1)
-            event.accepted = true
-          } else if (event.key === Qt.Key_Slash) {
-            filterField.forceActiveFocus()
             event.accepted = true
           }
         }
@@ -645,11 +711,36 @@ Item {
             width: parent.width
             spacing: Style.space(6)
 
+            Text {
+              width: parent.width
+              text: "Create a Slack app from the manifest in docs/OWN-APP.md, Install to Workspace, then copy the User OAuth Token (starts with xoxp-)."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            // Click to open Slack's app-management page in the browser.
+            Text {
+              text: "→ open api.slack.com/apps"
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.underline: tokenLinkHelp.containsMouse
+              MouseArea {
+                id: tokenLinkHelp
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.openUrl("https://api.slack.com/apps")
+              }
+            }
+
             TextField {
               id: tokenField
               width: parent.width
               password: true
-              placeholderText: "xoxp-… (User OAuth Token — see README)"
+              placeholderText: "xoxp-… (User OAuth Token)"
               foreground: root.foreground
               font.family: root.fontFamily
 
@@ -932,19 +1023,54 @@ Item {
                     required property var modelData
                     readonly property bool current: root.convo !== null && root.convo.id === modelData.id
                     width: convColumn.width
-                    height: Style.space(28)
+                    height: Style.space(30)
                     radius: root.cornerRadius
                     color: current ? root.selectedBackground
                          : (dmArea.containsMouse ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent")
 
-                    Text {
+                    // Rounded avatar (Slack profile image), with an initial fallback.
+                    Rectangle {
+                      id: dmAv
+                      width: Style.space(20)
+                      height: Style.space(20)
+                      radius: dmRow.modelData.kind === "mpim" ? Style.space(4) : width / 2
                       anchors.left: parent.left
+                      anchors.leftMargin: Style.space(6)
+                      anchors.verticalCenter: parent.verticalCenter
+                      clip: true
+                      color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.25)
+
+                      Text {
+                        anchors.centerIn: parent
+                        visible: dmImg.status !== Image.Ready
+                        textFormat: Text.PlainText
+                        text: (Model.displayName(dmRow.modelData).charAt(0) || "?").toUpperCase()
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Math.max(8, Style.font.caption)
+                        font.bold: true
+                      }
+                      Image {
+                        id: dmImg
+                        anchors.fill: parent
+                        source: Model.validAvatar(dmRow.modelData.avatar) ? dmRow.modelData.avatar : ""
+                        sourceSize.width: 48
+                        sourceSize.height: 48
+                        fillMode: Image.PreserveAspectCrop
+                        asynchronous: true
+                        cache: true
+                        visible: status === Image.Ready
+                      }
+                    }
+
+                    Text {
+                      anchors.left: dmAv.right
                       anchors.leftMargin: Style.space(8)
                       anchors.right: dmBadge.visible ? dmBadge.left : parent.right
                       anchors.rightMargin: Style.space(8)
                       anchors.verticalCenter: parent.verticalCenter
                       textFormat: Text.PlainText
-                      text: "@ " + Model.displayName(dmRow.modelData)
+                      text: Model.displayName(dmRow.modelData)
                       color: dmRow.current ? root.selectedText : root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.bodySmall
@@ -1223,88 +1349,219 @@ Item {
               }
             }
 
-            Flickable {
-              id: messageScroll
+            Item {
+              id: messageArea
               visible: !root.settingsMode && root.convo !== null
               width: parent.width
               height: parent.height - Style.space(24) - composeRow.height - Style.space(24)
-              contentWidth: width
-              contentHeight: messageColumn.implicitHeight
-              clip: true
-              boundsBehavior: Flickable.StopAtBounds
-              interactive: contentHeight > height
 
-              Column {
-                id: messageColumn
-                width: messageScroll.width
-                spacing: Style.space(8)
+              Text {
+                textFormat: Text.PlainText
+                anchors.centerIn: parent
+                visible: root.historyLoading && root.messages.length === 0
+                text: "loading messages…"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
 
-                Text {
-                  textFormat: Text.PlainText
-                  visible: root.historyLoading && root.messages.length === 0
-                  width: parent.width
-                  topPadding: Style.space(30)
-                  text: "loading messages…"
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  horizontalAlignment: Text.AlignHCenter
-                }
+              Text {
+                textFormat: Text.PlainText
+                anchors.centerIn: parent
+                width: parent.width - Style.space(40)
+                visible: root.historyError !== ""
+                text: "⚠ " + root.historyError
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+              }
 
-                Text {
-                  textFormat: Text.PlainText
-                  visible: root.historyError !== ""
-                  width: parent.width
-                  topPadding: Style.space(30)
-                  text: "⚠ " + root.historyError
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  horizontalAlignment: Text.AlignHCenter
-                  wrapMode: Text.WordWrap
-                }
+              ListView {
+                id: messageList
+                anchors.fill: parent
+                model: root.messages
+                clip: true
+                spacing: Style.space(3)
+                boundsBehavior: Flickable.StopAtBounds
+                cacheBuffer: 400
 
-                Repeater {
-                  model: root.messages
+                delegate: Item {
+                  id: md
+                  required property var modelData
+                  required property int index
+                  width: messageList.width
+                  implicitHeight: mrow.implicitHeight + Style.space(6)
+                  height: implicitHeight
+                  readonly property bool selected: root.selectedMsg === index
 
-                  Column {
-                    id: msgItem
-                    required property var modelData
-                    width: parent.width
-                    spacing: Style.space(1)
+                  Rectangle {
+                    anchors.fill: parent
+                    anchors.rightMargin: Style.space(2)
+                    radius: root.cornerRadius
+                    color: md.selected ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.14)
+                         : (mArea.containsMouse ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent")
+                  }
 
-                    Row {
-                      spacing: Style.space(6)
+                  Row {
+                    id: mrow
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.leftMargin: Style.space(6)
+                    anchors.rightMargin: Style.space(6)
+                    anchors.topMargin: Style.space(3)
+                    spacing: Style.space(8)
+
+                    // Avatar column — image on the first message of a run only.
+                    Item {
+                      width: Style.space(28)
+                      height: Style.space(28)
+
+                      Rectangle {
+                        anchors.fill: parent
+                        visible: !md.modelData.grouped
+                        radius: width / 2
+                        clip: true
+                        color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.25)
+
+                        Text {
+                          anchors.centerIn: parent
+                          visible: mImg.status !== Image.Ready
+                          textFormat: Text.PlainText
+                          text: (String(md.modelData.name).charAt(0) || "?").toUpperCase()
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          font.bold: true
+                        }
+                        Image {
+                          id: mImg
+                          anchors.fill: parent
+                          source: Model.validAvatar(md.modelData.avatar) ? md.modelData.avatar : ""
+                          sourceSize.width: 64
+                          sourceSize.height: 64
+                          fillMode: Image.PreserveAspectCrop
+                          asynchronous: true
+                          cache: true
+                          visible: status === Image.Ready
+                        }
+                      }
+                    }
+
+                    Column {
+                      width: mrow.width - Style.space(28) - mrow.spacing
+                      spacing: Style.space(1)
+
+                      Row {
+                        visible: !md.modelData.grouped
+                        spacing: Style.space(6)
+                        Text {
+                          textFormat: Text.PlainText
+                          text: md.modelData.name
+                          color: md.modelData.mine ? Color.accent : root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          font.bold: true
+                          anchors.verticalCenter: parent.verticalCenter
+                        }
+                        Text {
+                          textFormat: Text.PlainText
+                          text: md.modelData.time
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Math.max(8, Style.font.caption - 1)
+                          anchors.verticalCenter: parent.verticalCenter
+                        }
+                      }
 
                       Text {
                         textFormat: Text.PlainText
-                        text: msgItem.modelData.name
-                        color: msgItem.modelData.mine ? Color.accent : root.foreground
+                        width: parent.width
+                        text: md.modelData.text
+                        color: md.modelData.system ? root.dim : root.foreground
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall
-                        font.bold: true
-                        anchors.verticalCenter: parent.verticalCenter
+                        font.italic: md.modelData.system === true
+                        wrapMode: Text.Wrap
                       }
-                      Text {
-                        textFormat: Text.PlainText
-                        text: msgItem.modelData.time
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Math.max(8, Style.font.caption - 1)
-                        anchors.verticalCenter: parent.verticalCenter
+
+                      // Inline "open link" affordance when the message has a URL.
+                      Rectangle {
+                        visible: md.modelData.url !== ""
+                        width: linkRow.implicitWidth + Style.space(10)
+                        height: linkRow.implicitHeight + Style.space(4)
+                        radius: root.cornerRadius
+                        color: linkArea.containsMouse ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+                        border.width: 1
+                        border.color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.4)
+
+                        Row {
+                          id: linkRow
+                          anchors.centerIn: parent
+                          spacing: Style.space(4)
+                          Text {
+                            text: ""  // nf-fa-external-link
+                            color: Color.accent
+                            font.family: root.fontFamily
+                            font.pixelSize: Math.max(8, Style.font.caption - 1)
+                            anchors.verticalCenter: parent.verticalCenter
+                          }
+                          Text {
+                            text: "open link"
+                            color: root.dim
+                            font.family: root.fontFamily
+                            font.pixelSize: Math.max(8, Style.font.caption - 1)
+                            anchors.verticalCenter: parent.verticalCenter
+                          }
+                        }
+                        MouseArea {
+                          id: linkArea
+                          anchors.fill: parent
+                          hoverEnabled: true
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.openUrl(md.modelData.url)
+                        }
                       }
                     }
+                  }
+
+                  // Hover copy button, top-right.
+                  Rectangle {
+                    visible: mArea.containsMouse || copyArea.containsMouse
+                    width: Style.space(20)
+                    height: Style.space(20)
+                    radius: Math.min(4, Style.cornerRadius)
+                    anchors.top: parent.top
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(4)
+                    anchors.topMargin: Style.space(2)
+                    color: copyArea.containsMouse ? Style.hoverFillFor(root.foreground, Color.accent) : root.background
 
                     Text {
-                      textFormat: Text.PlainText
-                      width: parent.width
-                      text: msgItem.modelData.text
-                      color: msgItem.modelData.system ? root.dim : root.foreground
+                      anchors.centerIn: parent
+                      text: ""  // nf-fa-copy
+                      color: root.dim
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.bodySmall
-                      font.italic: msgItem.modelData.system === true
-                      wrapMode: Text.Wrap
+                      font.pixelSize: Math.max(8, Style.font.caption)
                     }
+                    MouseArea {
+                      id: copyArea
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: { root.selectedMsg = md.index; root.copyText(md.modelData.text) }
+                    }
+                  }
+
+                  MouseArea {
+                    id: mArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    acceptedButtons: Qt.LeftButton
+                    onClicked: root.selectedMsg = md.index
+                    z: -1
                   }
                 }
               }
@@ -1376,6 +1633,103 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
+            }
+          }
+        }
+
+        // ---- "copied" flash toast ----
+        Rectangle {
+          visible: root.flash !== ""
+          anchors.horizontalCenter: parent.horizontalCenter
+          anchors.bottom: parent.bottom
+          anchors.bottomMargin: Style.space(16)
+          width: flashText.implicitWidth + Style.space(24)
+          height: flashText.implicitHeight + Style.space(12)
+          radius: height / 2
+          color: Color.accent
+          Text {
+            id: flashText
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: root.flash
+            color: Color.background
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+        }
+
+        // ---- keyboard shortcuts overlay (press ? or Ctrl+/) ----
+        Rectangle {
+          visible: root.showShortcuts
+          anchors.fill: parent
+          color: Qt.rgba(root.background.r, root.background.g, root.background.b, 0.86)
+
+          MouseArea { anchors.fill: parent; onClicked: root.showShortcuts = false }
+
+          Column {
+            anchors.centerIn: parent
+            width: Math.min(parent.width - Style.space(60), Style.space(460))
+            spacing: Style.space(6)
+
+            Text {
+              text: "KEYBOARD SHORTCUTS"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              font.letterSpacing: 1
+              bottomPadding: Style.space(6)
+            }
+
+            Repeater {
+              model: [
+                { k: "↑ / ↓", d: "Move between conversations" },
+                { k: "/", d: "Filter conversations" },
+                { k: "Enter", d: "Open filtered / open selected link" },
+                { k: "j / k", d: "Select message (down / up)" },
+                { k: "y", d: "Copy selected message" },
+                { k: "o", d: "Open link in selected message" },
+                { k: "i", d: "Jump to the message box" },
+                { k: "Esc", d: "Back to list / close app" },
+                { k: "?  or  Ctrl+/", d: "Toggle this help" }
+              ]
+              Row {
+                required property var modelData
+                spacing: Style.space(12)
+                Rectangle {
+                  width: Style.space(96)
+                  height: kText.implicitHeight + Style.space(6)
+                  radius: Math.min(4, Style.cornerRadius)
+                  color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.22)
+                  Text {
+                    id: kText
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: parent.parent.modelData.k
+                    color: Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                  }
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  text: parent.modelData.d
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+              }
+            }
+
+            Text {
+              text: "press any key to close"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              topPadding: Style.space(8)
             }
           }
         }

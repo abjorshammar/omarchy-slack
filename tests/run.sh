@@ -214,25 +214,41 @@ out="$(run snooze '60; reboot')"
 check "snooze validates minutes" "$(jq -r '.ok' <<<"$out")" "false"
 
 echo "== oauth login plumbing"
-# The plugin ships a ready client_id + proxy_url, so browser sign-in is
-# available by default (the button shows out of the box).
+# No proxy ships with the plugin: the exchange host sees the user token, so
+# browser sign-in must be off until the user configures their OWN app + proxy.
 out="$(run login-available)"
-check "login available by default (ships client_id + proxy_url)" "$(jq -r '.available' <<<"$out")" "true"
-# and the shipped config never contains a secret (it lives only in the proxy)
+check "login NOT available by default (no shipped proxy)" "$(jq -r '.available' <<<"$out")" "false"
+# and the shipped config carries neither a secret nor an operator proxy
 check "shipped config ships no secret" "$(jq -r 'has("client_secret")' "$HERE/../config/oauth.json")" "false"
-check "shipped config has an https proxy_url" "$(jq -r '.proxy_url | test("^https://")' "$HERE/../config/oauth.json")" "true"
+check "shipped config ships no proxy_url" "$(jq -r 'has("proxy_url")' "$HERE/../config/oauth.json")" "false"
 
-# oauth_config validation: a user override that is malformed (no https proxy)
-# must not be accepted as-is. Point the shipped fallback away so we test the
-# override in isolation by giving it a bad proxy AND a bad client id.
 mkdir -p "$XDG_CONFIG_HOME/omarchy-slack"
+# A valid user-owned config enables the browser flow…
+cat > "$XDG_CONFIG_HOME/omarchy-slack/oauth.json" <<'EOF'
+{"client_id":"111.222","proxy_url":"https://my-own.example.workers.dev","port":41879}
+EOF
+out="$(run login-available)"
+check "own app + proxy config enables login" "$(jq -r '.available' <<<"$out")" "true"
+# …while a malformed one (non-https proxy) is refused, leaving login off.
 cat > "$XDG_CONFIG_HOME/omarchy-slack/oauth.json" <<'EOF'
 {"client_id":"111.222","proxy_url":"http://insecure.example","port":41879}
 EOF
-# override is invalid (non-https proxy) -> falls back to the valid shipped config
 out="$(run login-available)"
-check "invalid override falls back to shipped (still available)" "$(jq -r '.available' <<<"$out")" "true"
+check "invalid override leaves login unavailable" "$(jq -r '.available' <<<"$out")" "false"
 rm -f "$XDG_CONFIG_HOME/omarchy-slack/oauth.json"
+
+# Token file symlink resistance: a planted symlink must be neither read
+# through nor written through.
+victim="$WORK/victim-file"
+printf 'xoxp-1234567890-SHOULDNOTREAD\n' > "$victim"
+mkdir -p "$XDG_CONFIG_HOME/omarchy-slack"
+rm -f "$XDG_CONFIG_HOME/omarchy-slack/token"
+ln -s "$victim" "$XDG_CONFIG_HOME/omarchy-slack/token"
+out="$(run counts 2>/dev/null || true)"
+check "symlinked token file is not read through" "$(jq -r '.error // ""' <<<"$out" | grep -c "not signed in\|no token" || true)" "1"
+out="$(printf 'xoxp-1234567890-abcdefME\n' | run set-token)"
+check "store replaces a planted symlink" "$([ -f "$XDG_CONFIG_HOME/omarchy-slack/token" ] && [ ! -L "$XDG_CONFIG_HOME/omarchy-slack/token" ] && echo yes)" "yes"
+check "symlink target was not written through" "$(head -c 40 "$victim")" "xoxp-1234567890-SHOULDNOTREAD"
 
 # The loopback listener in PROXY mode: it waits for ?token=…&state=…, refuses
 # wrong state, and prints the token. Browser opener stubbed via PATH.

@@ -58,25 +58,23 @@ windowrulev2 = size 980 720, title:^(Omarchy Slack)$
 windowrulev2 = center, title:^(Omarchy Slack)$
 ```
 
-## How sign-in works (and the paste-a-token fallback)
+## How sign-in works
 
-Slack, unlike Spotify, has no PKCE and requires an HTTPS redirect, so a public
-client can't finish OAuth entirely on its own. The browser flow works like
-this: the plugin starts a listener on `127.0.0.1`, opens Slack's consent page,
-and you pick any workspace. Slack redirects to a small **OAuth proxy** (a
-stateless Cloudflare Worker that holds only the client secret — see
-`oauth-proxy/`), which performs the `code → token` exchange and hands the
-token straight back to your local listener over loopback. The token is stored
-in your GNOME keyring; the client secret never lives in this repo.
+The default path is **paste a token**: follow `docs/OWN-APP.md` to create a
+personal Slack app (two minutes) and paste its User OAuth Token. The token is
+stored in your GNOME keyring when one is available, else in a private file.
+No third party is involved at any point.
 
-The "Sign in with Slack" button appears once a `proxy_url` is set in
-`config/oauth.json` (the publisher deploys the Worker once — see
-`oauth-proxy/README.md`).
-
-If you'd rather use your own Slack app — or no proxy is configured — choose
-*paste a token instead* and follow `docs/OWN-APP.md` to create a personal
-Slack app and paste its User OAuth Token. You can also point
-`~/.config/omarchy-slack/oauth.json` at your own app + your own proxy.
+Browser sign-in exists but is deliberately **not configured out of the box**.
+Slack, unlike Spotify, has no PKCE and requires an HTTPS redirect, so the
+`code → token` exchange must run on a server holding the client secret — and
+whoever operates that server momentarily handles your user token. That is a
+trust decision only you should make, so this plugin ships no default proxy:
+if you want the browser flow, deploy your own stateless Cloudflare Worker
+(`oauth-proxy/README.md`), then point `~/.config/omarchy-slack/oauth.json` at
+your own app and your own proxy. The "Sign in with Slack" button appears once
+that file validates, and the whole flow then runs on infrastructure you
+control: loopback listener, your proxy, your keyring.
 
 ### Optional: sync read state to your other Slack clients
 

@@ -1,6 +1,3 @@
 {
-  "_comment": "Browser sign-in config. No client secret lives here or anywhere in this repo — the secret is held only by the OAuth proxy (see oauth-proxy/). After deploying the proxy, set proxy_url to your Worker URL (e.g. https://omarchy-slack-oauth.<subdomain>.workers.dev). The 'Sign in with Slack' button appears once proxy_url is set. Users can override this file at ~/.config/omarchy-slack/oauth.json to point at their own app + proxy.",
-  "client_id": "11915798015376.11891122664404",
-  "proxy_url": "https://omarchy-slack-oauth.cbottelet.workers.dev",
-  "port": 41879
+  "_comment": "Browser sign-in config. Deliberately not shipped configured: the code-to-token exchange host sees the resulting user token, so that exchange should only ever run on infrastructure YOU control. Create a personal Slack app (docs/OWN-APP.md), deploy your own proxy (oauth-proxy/README.md), then write ~/.config/omarchy-slack/oauth.json with client_id, proxy_url, and optionally port. The 'Sign in with Slack' button appears once that file validates. Without it, paste a token instead."
 }

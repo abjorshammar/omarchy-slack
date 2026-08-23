@@ -45,8 +45,22 @@ read_token() {
   if have_keyring; then
     t="$(timeout 3 secret-tool lookup service omarchy-slack key token 2>/dev/null || true)"
   fi
-  if [[ -z "$t" && -f "$TOKEN_FILE" ]]; then
-    t="$(head -c 512 "$TOKEN_FILE" | tr -d '[:space:]')"
+  if [[ -z "$t" && -e "$TOKEN_FILE" ]]; then
+    # Descriptor-bound no-follow read: a planted symlink or irregular file at
+    # the token path is refused outright instead of trusted via a pathname
+    # check that races. python3 is already a dependency (oauth-callback.py).
+    t="$(python3 - "$TOKEN_FILE" <<'PY' 2>/dev/null | tr -d '[:space:]'
+import os, stat, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+except OSError:
+    sys.exit(1)
+st = os.fstat(fd)
+if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+    sys.exit(1)
+sys.stdout.write(os.read(fd, 512).decode("utf-8", "replace"))
+PY
+)"
   fi
   [[ "$t" =~ ^xox[pb]-[A-Za-z0-9-]{10,200}$ ]] || return 1
   printf '%s' "$t"
@@ -59,7 +73,16 @@ store_raw_token() {
     STORED="keyring"
     rm -f "$TOKEN_FILE" 2>/dev/null
   else
-    ( umask 077 && mkdir -p "$CONFIG_DIR" && printf '%s\n' "$t" > "$TOKEN_FILE" ) || emit_error "could not write token file"
+    # Write to a fresh temp file, then rename over the destination: rename()
+    # replaces even a planted symlink with the regular file instead of
+    # following it, and the swap is atomic.
+    (
+      umask 077
+      mkdir -p "$CONFIG_DIR" || exit 1
+      tmp="$(mktemp "$CONFIG_DIR/.token.XXXXXX")" || exit 1
+      printf '%s\n' "$t" > "$tmp" || { rm -f "$tmp"; exit 1; }
+      mv -f "$tmp" "$TOKEN_FILE"
+    ) || emit_error "could not write token file"
     STORED="file"
   fi
 }

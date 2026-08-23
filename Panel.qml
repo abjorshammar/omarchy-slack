@@ -57,6 +57,11 @@ Item {
   readonly property bool snoozing: counts ? counts.snoozing === true : false
   readonly property string snoozeUntil: counts ? Model.snoozeLabel(counts.snooze_until) : ""
 
+  // Unread totals for the header summary: mentions = unread DMs + group DMs
+  // (each aimed at you); unreadChannels = channels with any unread.
+  readonly property int totalMentions: Model.mentionCount(conversations)
+  readonly property int totalUnreadChannels: Model.unreadChannelCount(conversations)
+
   property var convo: null
   property var messages: []
   property string historyNote: ""
@@ -928,6 +933,86 @@ Item {
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideRight
                   width: Math.min(implicitWidth, root.sidebarWidth - Style.space(60))
+                }
+              }
+
+            }
+
+            // Unread summary row (full width): red pill = unread DMs/group
+            // DMs (mentions); accent pill = channels with unreads. Hidden when
+            // all caught up.
+            Item {
+              width: parent.width
+              visible: root.totalMentions > 0 || root.totalUnreadChannels > 0
+              height: visible ? Style.space(20) : 0
+
+              Text {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: "UNREAD"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Math.max(8, Style.font.caption - 1)
+                font.bold: true
+                font.letterSpacing: 1
+              }
+
+              Row {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(6)
+
+                Rectangle {
+                  visible: root.totalMentions > 0
+                  width: Math.max(height, menBadge.implicitWidth + Style.space(8))
+                  height: Style.space(18)
+                  radius: height / 2
+                  color: Color.urgent
+                  anchors.verticalCenter: parent.verticalCenter
+                  Text {
+                    id: menBadge
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: (root.totalMentions > 99 ? "99+" : root.totalMentions) + (root.totalMentions === 1 ? " DM" : " DMs")
+                    color: Color.background
+                    font.family: root.fontFamily
+                    font.pixelSize: Math.max(8, Style.font.caption - 1)
+                    font.bold: true
+                  }
+                }
+
+                Rectangle {
+                  visible: root.totalUnreadChannels > 0
+                  width: chBadgeRow.implicitWidth + Style.space(10)
+                  height: Style.space(18)
+                  radius: height / 2
+                  color: "transparent"
+                  border.width: 1
+                  border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.7)
+                  anchors.verticalCenter: parent.verticalCenter
+                  Row {
+                    id: chBadgeRow
+                    anchors.centerIn: parent
+                    spacing: Style.space(2)
+                    Text {
+                      text: "#"
+                      color: Color.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: Math.max(8, Style.font.caption - 1)
+                      font.bold: true
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      text: root.totalUnreadChannels
+                      color: Color.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: Math.max(8, Style.font.caption - 1)
+                      font.bold: true
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
                 }
               }
             }

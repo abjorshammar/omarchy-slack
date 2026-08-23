@@ -52,6 +52,10 @@ If you also want the browser flow against your own app:
 
 The user config takes precedence over the plugin's shipped credentials.
 
+Note: the shipped bounce page forwards to port `41879` specifically. If you
+change `port`, you must host your own copy of `docs/oauth.html` with the
+matching port and point `redirect` at it.
+
 ## Optional read-state sync scopes
 
 Add `channels:write`, `groups:write`, `im:write`, `mpim:write` to the user

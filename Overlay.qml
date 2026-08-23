@@ -138,6 +138,9 @@ Item {
   function applyHistory(raw) {
     historyLoading = false
     var data = Model.parseJson(raw)
+    // A fetch started for one conversation may land after the user switched
+    // to another — drop it instead of rendering (and marking read) wrongly.
+    if (!convo || (data.channel && data.channel !== convo.id)) return
     if (!data.ok) {
       historyError = Model.friendlyError(data.error)
       return
@@ -179,6 +182,7 @@ Item {
     historyLoading = true
     composeField.text = ""
     if (historyProc.running) historyProc.running = false
+    historyProc.cmd = Model.historyCommand(scriptDir, convo.id)
     historyProc.running = true
     Qt.callLater(function() { composeField.forceActiveFocus() })
   }
@@ -186,6 +190,7 @@ Item {
   function refreshHistory() {
     if (!convo || historyProc.running) return
     historyLoading = true
+    historyProc.cmd = Model.historyCommand(scriptDir, convo.id)
     historyProc.running = true
   }
 
@@ -194,6 +199,9 @@ Item {
     if (!convo || sending || String(text).replace(/\s+/g, "") === "") return
     sending = true
     sendError = ""
+    // Snapshot the destination now — a live binding could re-resolve to a
+    // different conversation between here and process start.
+    sendProc.cmd = Model.sendCommand(scriptDir, convo.id)
     sendProc.pendingText = String(text)
     sendProc.stdinEnabled = true
     sendProc.running = true
@@ -267,11 +275,11 @@ Item {
   function tokenFinished(raw) {
     tokenBusy = false
     var data = Model.parseJson(raw)
+    tokenField.text = ""
     if (!data.ok) {
       tokenFeedback = Model.friendlyError(data.error)
       return
     }
-    tokenField.text = ""
     tokenFeedback = ""
     tokenState = "valid"
     teamName = String(data.team || "")
@@ -350,7 +358,8 @@ Item {
 
   Process {
     id: historyProc
-    command: root.convo ? Model.historyCommand(root.scriptDir, root.convo.id) : ["true"]
+    property var cmd: ["true"]
+    command: cmd
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyHistory(text)
@@ -362,7 +371,8 @@ Item {
   Process {
     id: sendProc
     property string pendingText: ""
-    command: root.convo ? Model.sendCommand(root.scriptDir, root.convo.id) : ["true"]
+    property var cmd: ["true"]
+    command: cmd
     stdinEnabled: true
     onStarted: {
       write(pendingText)
@@ -498,6 +508,7 @@ Item {
           spacing: Style.space(14)
 
           Text {
+            textFormat: Text.PlainText
             anchors.horizontalCenter: parent.horizontalCenter
             text: ""
             color: root.foreground
@@ -506,6 +517,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.horizontalCenter: parent.horizontalCenter
             text: "Omarchy Slack"
             color: root.foreground
@@ -515,6 +527,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: root.tokenState === "invalid"
               ? "Slack rejected the saved sign-in. Sign in again to continue."
@@ -540,6 +553,7 @@ Item {
               spacing: Style.space(8)
 
               Text {
+                textFormat: Text.PlainText
                 text: ""
                 color: Color.background
                 font.family: root.fontFamily
@@ -547,6 +561,7 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
               }
               Text {
+                textFormat: Text.PlainText
                 text: "Sign in with Slack"
                 color: Color.background
                 font.family: root.fontFamily
@@ -571,6 +586,7 @@ Item {
             spacing: Style.space(8)
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Finishing sign-in in your browser…"
               color: root.foreground
@@ -589,6 +605,7 @@ Item {
               border.color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.45)
 
               Text {
+                textFormat: Text.PlainText
                 id: cancelText
                 anchors.centerIn: parent
                 text: "Cancel"
@@ -621,6 +638,7 @@ Item {
 
           // Advanced: paste a token instead of the browser flow.
           Text {
+            textFormat: Text.PlainText
             visible: !root.showTokenEntry && !root.loginBusy
             anchors.horizontalCenter: parent.horizontalCenter
             text: root.loginAvailable ? "advanced: paste a token instead" : "paste a token to sign in"
@@ -649,6 +667,7 @@ Item {
             TextField {
               id: tokenField
               width: parent.width
+              password: true
               placeholderText: "xoxp-… (User OAuth Token — see README)"
               foreground: root.foreground
               font.family: root.fontFamily
@@ -698,6 +717,7 @@ Item {
               spacing: Style.space(8)
 
               Text {
+                textFormat: Text.PlainText
                 text: ""
                 color: root.foreground
                 font.family: root.fontFamily
@@ -757,6 +777,7 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                   }
                   Text {
+                    textFormat: Text.PlainText
                     text: root.presence === "away" ? "AWAY" : "ACTIVE"
                     color: root.presence === "away" ? root.dim : Color.accent
                     font.family: root.fontFamily
@@ -785,6 +806,7 @@ Item {
                 border.color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.35)
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   text: root.snoozing ? "" : ""
                   color: root.snoozing ? Color.urgent : root.dim
@@ -810,6 +832,7 @@ Item {
                 border.color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.35)
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   text: ""
                   color: root.dim
@@ -838,6 +861,7 @@ Item {
                 border.color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.35)
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   text: ""
                   color: root.settingsMode ? Color.accent : root.dim
@@ -911,6 +935,7 @@ Item {
                 spacing: Style.space(1)
 
                 Text {
+                  textFormat: Text.PlainText
                   visible: root.dmRows.length > 0
                   text: "DIRECT MESSAGES"
                   color: root.dim
@@ -984,6 +1009,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   visible: root.channelRows.length > 0
                   text: "CHANNELS"
                   color: root.dim
@@ -1093,6 +1119,7 @@ Item {
               spacing: Style.space(10)
 
               Text {
+                textFormat: Text.PlainText
                 text: "SETTINGS"
                 color: root.dim
                 font.family: root.fontFamily
@@ -1111,6 +1138,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: "Reading here always clears the badge locally. To also mark conversations read on your phone and other Slack clients, the Slack app needs the optional write scopes (see README) — without them Slack silently keeps its own read state."
                 color: root.dim
@@ -1120,6 +1148,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: "The bar badge counts unread DMs and group DMs; channels light the icon. Unread counts poll every few minutes (omarchy bar set bottelet.slack refreshMinutes N)."
                 color: root.dim
@@ -1137,6 +1166,7 @@ Item {
                 border.color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.45)
 
                 Text {
+                  textFormat: Text.PlainText
                   id: signOutText
                   anchors.centerIn: parent
                   text: "  Sign out & forget token"
@@ -1166,6 +1196,7 @@ Item {
               spacing: Style.space(8)
 
               Text {
+                textFormat: Text.PlainText
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: ""
                 color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.5)
@@ -1173,6 +1204,7 @@ Item {
                 font.pixelSize: Style.font.title * 2
               }
               Text {
+                textFormat: Text.PlainText
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: "Pick a conversation — ↑/↓ and Enter work too"
                 color: root.dim
@@ -1340,6 +1372,7 @@ Item {
                 border.color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.45)
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   text: ""
                   color: root.sending ? root.dim : Color.accent

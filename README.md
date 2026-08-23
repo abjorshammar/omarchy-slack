@@ -95,7 +95,13 @@ use different (roomier) API methods and poll every 3 minutes by default
   responses are size-capped, every channel id is regex-validated before use,
   and everything Slack returns renders as plain text — no HTML sinks.
 - The OAuth listener binds `127.0.0.1` only, accepts a single
-  state-validated callback, and dies after four minutes.
+  state-validated callback, and dies after four minutes. During sign-in the
+  short-lived authorization code passes through the GitHub Pages redirect
+  URL (Slack requires HTTPS redirects); the page strips it from browser
+  history, sends no referrer, and the code is useless without completing
+  the exchange within minutes.
+- Message caches and read markers live in `~/.cache/omarchy-slack` with
+  `0700`/`0600` permissions — private to your user, like the token.
 - Like every native app with browser sign-in (GitHub CLI included), the
   shipped OAuth client credentials are public. They can't read anyone's
   Slack: a token is only ever issued to the person who completes the consent

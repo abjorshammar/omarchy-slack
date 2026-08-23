@@ -115,9 +115,18 @@ check "dm name resolved" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") |
 check "channel kind" "$(jq -r '.conversations[] | select(.id=="C0BBBBBB2") | .kind' <<<"$out")" "channel"
 check "presence" "$(jq -r '.presence' <<<"$out")" "active"
 
+echo "== cache privacy"
+check "cache dir is 0700" "$(stat -c %a "$XDG_CACHE_HOME/omarchy-slack")" "700"
+for f in "$XDG_CACHE_HOME/omarchy-slack"/*; do
+  [[ -f "$f" ]] || continue
+  perms="$(stat -c %a "$f")"
+  if [[ "$perms" != "600" ]]; then fail "cache file $f is $perms, not 600"; else ok "cache file $(basename "$f") is 0600"; fi
+done
+
 echo "== history"
 out="$(run history D0AAAAAA1)"
 check "history ok" "$(jq -r '.ok' <<<"$out")" "true"
+check "history names its channel" "$(jq -r '.channel' <<<"$out")" "D0AAAAAA1"
 check "chronological order" "$(jq -r '.messages[0].ts' <<<"$out")" "1755900001.000100"
 check "user map present" "$(jq -r '.users.U2222222' <<<"$out")" "jane.d"
 n_before="$(grep -c conversations.history "$CURL_LOG")"

@@ -28,7 +28,12 @@ CURL=(curl -sS --proto '=https' --proto-redir '=https' --max-filesize "$MAX_BYTE
 
 emit_error() { jq -cn --arg e "$1" '{ok:false,error:$e}'; exit 0; }
 
+# Everything this script writes is private to the user: cached DMs, read
+# markers, the OAuth code in flight. 0700/0600 across the board, and repair
+# directories created by older builds.
+umask 077
 mkdir -p "$CACHE_DIR" || emit_error "cannot create cache dir"
+chmod 700 "$CACHE_DIR" 2>/dev/null || true
 
 # ---------------------------------------------------------------- token store
 
@@ -125,6 +130,7 @@ cmd_login() {
   # prints the authorization code on success and nothing else.
   local tmp pypid rc code
   tmp="$CACHE_DIR/.oauth-code.$$"
+  : > "$tmp" || emit_error "cannot write cache dir"   # 0600 under umask 077, before the listener starts
   python3 "$SCRIPT_DIR/oauth-callback.py" "$port" "$state" "$auth_url" > "$tmp" 2>/dev/null &
   pypid=$!
   trap 'kill "$pypid" 2>/dev/null; rm -f "$tmp"' EXIT TERM INT
@@ -214,9 +220,13 @@ resolve_users() {
     name="$(jq -r '.user.profile.display_name // "" | select(. != "")' <<<"$info" 2>/dev/null)"
     [[ -z "$name" ]] && name="$(jq -r '.user.real_name // .user.name // ""' <<<"$info" 2>/dev/null)"
     [[ -z "$name" ]] && continue
+    name="${name:0:80}"
     cache="$(jq -c --arg id "$uid" --arg n "$name" '.[$id] = $n' <<<"$cache")"
   done <<<"$missing"
-  printf '%s' "$cache" > "$USERS_CACHE.tmp.$$" && mv "$USERS_CACHE.tmp.$$" "$USERS_CACHE"
+  # Bound the cache: 80-char names above, 400 entries here.
+  cache="$(jq -c 'to_entries | .[-400:] | from_entries' <<<"$cache")"
+  local tmp
+  tmp="$(mktemp "$USERS_CACHE.XXXXXX")" && printf '%s' "$cache" > "$tmp" && mv "$tmp" "$USERS_CACHE"
   printf '%s' "$cache"
 }
 
@@ -341,15 +351,17 @@ cmd_history() {
     emit_error "$err"
   fi
 
-  local msgs uids users out
+  local msgs uids users out tmp
   msgs="$(jq -c '[.messages[]? | select(.type == "message")
     | {ts: (.ts // ""), user: (.user // ""), bot: (.bot_id // ""),
        username: (.username // ""), subtype: (.subtype // ""),
        text: ((.text // "") | .[0:8000])}] | reverse' <<<"$res")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
   users="$(resolve_users "$uids")"
-  out="$(jq -cn --argjson m "$msgs" --argjson u "$users" '{ok:true, messages:$m, users:$u}')"
-  printf '%s' "$out" > "$cache_file.tmp.$$" && mv "$cache_file.tmp.$$" "$cache_file"
+  # channel rides along so the UI can drop a payload that arrives after the
+  # user has already switched conversations.
+  out="$(jq -cn --arg ch "$id" --argjson m "$msgs" --argjson u "$users" '{ok:true, channel:$ch, messages:$m, users:$u}')"
+  tmp="$(mktemp "$cache_file.XXXXXX")" && printf '%s' "$out" > "$tmp" && mv "$tmp" "$cache_file"
   printf '%s\n' "$out"
 }
 
@@ -394,12 +406,14 @@ cmd_seen() {
   seen="$(jq -c --arg id "$id" --arg ts "$ts" \
     '.[$id] = (if (.[$id] // "0" | tonumber) > ($ts | tonumber) then .[$id] else $ts end)
      | to_entries | sort_by(.value | tonumber) | .[-300:] | from_entries' <<<"$seen")"
-  printf '%s' "$seen" > "$SEEN_FILE.tmp.$$" && mv "$SEEN_FILE.tmp.$$" "$SEEN_FILE"
+  local tmp
+  tmp="$(mktemp "$SEEN_FILE.XXXXXX")" && printf '%s' "$seen" > "$tmp" && mv "$tmp" "$SEEN_FILE"
 
   local res marked=false
-  res="$(api_call conversations.mark -X POST \
-    -H 'Content-Type: application/json; charset=utf-8' \
-    --data-binary "$(jq -cn --arg ch "$id" --arg ts "$ts" '{channel:$ch, ts:$ts}')" 2>/dev/null || echo '{}')"
+  res="$(jq -cn --arg ch "$id" --arg ts "$ts" '{channel:$ch, ts:$ts}' \
+    | api_call conversations.mark -X POST \
+        -H 'Content-Type: application/json; charset=utf-8' \
+        --data-binary @- 2>/dev/null || echo '{}')"
   jq -e '.ok == true' <<<"$res" >/dev/null 2>&1 && marked=true
   jq -cn --argjson m "$marked" '{ok:true, marked:$m}'
 }

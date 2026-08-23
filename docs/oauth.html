@@ -1,5 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
 <title>Omarchy Slack sign-in</title>
 <style>
   :root { color-scheme: light dark }
@@ -23,6 +24,8 @@
   (function () {
     var q = window.location.search;
     if (/^\?(?=.*code=)(?=.*state=)[\x20-\x7e]*$/.test(q)) {
+      // Scrub the short-lived code from browser history before forwarding.
+      try { history.replaceState({}, "", location.pathname); } catch (e) {}
       window.location.replace("http://127.0.0.1:41879/callback" + q);
       setTimeout(function () {
         document.getElementById("fallback").hidden = false;

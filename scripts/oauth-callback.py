@@ -12,11 +12,12 @@ polite error page and the wait continues. Exit codes: 1 timeout/usage,
 stdlib only — no third-party imports, binds loopback only, serves no files.
 """
 import re
+import signal
 import subprocess
 import sys
 import time
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TIMEOUT_SECS = 240
 
@@ -43,9 +44,16 @@ def main() -> int:
     if not auth_url.startswith("https://slack.com/oauth/"):
         return 1
 
+    # Hard ceiling: no path (idle sockets included) may outlive the deadline.
+    signal.alarm(TIMEOUT_SECS + 10)
+
     result = {}
 
     class Handler(BaseHTTPRequestHandler):
+        # Per-connection socket timeout: a client that connects and never
+        # sends a request cannot pin the server (single idle TCP connection
+        # would otherwise block handle_one_request forever).
+        timeout = 10
         def do_GET(self):  # noqa: N802 (http.server API)
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path != "/callback":
@@ -81,7 +89,8 @@ def main() -> int:
             pass
 
     try:
-        server = HTTPServer(("127.0.0.1", port), Handler)
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        server.daemon_threads = True
     except OSError:
         return 2
 

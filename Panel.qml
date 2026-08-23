@@ -591,15 +591,34 @@ Item {
             event.accepted = true
             return
           }
+          var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
           if (event.key === Qt.Key_Escape) {
             if (root.threadTs !== "") root.closeThread()
             else if (inConvo) root.backToList()
             else root.dismiss()
             event.accepted = true
-          } else if (inConvo && event.key === Qt.Key_T) {
+
+          // Ctrl+J / Ctrl+K always move between conversations (checked before
+          // the plain j/k message keys so the modifier isn't swallowed).
+          } else if (ctrl && event.key === Qt.Key_J) {
+            root.selectStep(1)
+            event.accepted = true
+          } else if (ctrl && event.key === Qt.Key_K) {
+            root.selectStep(-1)
+            event.accepted = true
+
+          } else if (event.key === Qt.Key_Question || (ctrl && event.key === Qt.Key_Slash)) {
+            root.showShortcuts = true
+            event.accepted = true
+          } else if (!ctrl && event.key === Qt.Key_Slash) {
+            filterField.forceActiveFocus()
+            event.accepted = true
+
+          // In a conversation, plain (no-Ctrl) keys drive the message list.
+          } else if (inConvo && !ctrl && event.key === Qt.Key_T) {
             root.openThreadSelected()
             event.accepted = true
-          } else if (inConvo && event.key === Qt.Key_G) {
+          } else if (inConvo && !ctrl && event.key === Qt.Key_G) {
             if (event.modifiers & Qt.ShiftModifier) {
               root.selectedMsg = root.displayMessages.length - 1
               messageList.positionViewAtEnd()
@@ -615,35 +634,28 @@ Item {
           } else if (inConvo && event.key === Qt.Key_PageUp) {
             messageList.contentY = Math.max(0, messageList.contentY - messageList.height * 0.9)
             event.accepted = true
-          } else if (event.key === Qt.Key_Question
-                     || (event.key === Qt.Key_Slash && event.modifiers === Qt.ControlModifier)) {
-            root.showShortcuts = true
-            event.accepted = true
-          } else if (event.key === Qt.Key_Slash) {
-            filterField.forceActiveFocus()
-            event.accepted = true
-          } else if (inConvo && (event.key === Qt.Key_J || event.key === Qt.Key_Down)) {
+          } else if (inConvo && !ctrl && (event.key === Qt.Key_J || event.key === Qt.Key_Down)) {
             root.selectMsg(1)
             event.accepted = true
-          } else if (inConvo && (event.key === Qt.Key_K || event.key === Qt.Key_Up)) {
+          } else if (inConvo && !ctrl && (event.key === Qt.Key_K || event.key === Qt.Key_Up)) {
             root.selectMsg(-1)
             event.accepted = true
-          } else if (inConvo && event.key === Qt.Key_Y) {
+          } else if (inConvo && !ctrl && event.key === Qt.Key_Y) {
             root.copySelected()
             event.accepted = true
-          } else if (inConvo && (event.key === Qt.Key_O
+          } else if (inConvo && !ctrl && (event.key === Qt.Key_O
                      || event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
             root.openSelected()
             event.accepted = true
-          } else if (inConvo && event.key === Qt.Key_I) {
+          } else if (inConvo && !ctrl && event.key === Qt.Key_I) {
             composeField.forceActiveFocus()
             event.accepted = true
-          } else if (event.key === Qt.Key_Down
-                     || (event.key === Qt.Key_J && event.modifiers === Qt.ControlModifier)) {
+
+          // In the conversation list, plain arrows move between conversations.
+          } else if (!ctrl && event.key === Qt.Key_Down) {
             root.selectStep(1)
             event.accepted = true
-          } else if (event.key === Qt.Key_Up
-                     || (event.key === Qt.Key_K && event.modifiers === Qt.ControlModifier)) {
+          } else if (!ctrl && event.key === Qt.Key_Up) {
             root.selectStep(-1)
             event.accepted = true
           }
@@ -1993,7 +2005,7 @@ Item {
 
             Repeater {
               model: [
-                { k: "↑ / ↓", d: "Move between conversations" },
+                { k: "↑/↓ · Ctrl+J/K", d: "Move between conversations" },
                 { k: "/", d: "Filter conversations" },
                 { k: "Enter", d: "Open filtered / open selected link" },
                 { k: "j / k", d: "Select message (down / up)" },

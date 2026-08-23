@@ -323,13 +323,13 @@ cmd_counts() {
   fi
 
   jq -cn \
-    --argjson me "$(jq -c '{team:(.team // ""), user:(.user // ""), user_id:(.user_id // ""), url:(.url // "")}' <<<"$me")" \
+    --argjson me "$(jq -c '{team:(.team // ""), team_id:(.team_id // ""), user:(.user // ""), user_id:(.user_id // ""), url:(.url // "")}' <<<"$me")" \
     --argjson rows "$enriched" \
     --argjson users "$users" \
     --argjson presence "$(jq -c '{presence:(.presence // "")}' <<<"$presence" 2>/dev/null || echo '{"presence":""}')" \
     --argjson dnd "$(jq -c '{snoozing:(.snooze_enabled // false), snooze_until:(.snooze_endtime // 0)}' <<<"$dnd" 2>/dev/null || echo '{"snoozing":false,"snooze_until":0}')" \
     --argjson seen "$seen" \
-    '{ok:true, team:$me.team, self:$me.user, self_id:$me.user_id, url:$me.url, seen:$seen,
+    '{ok:true, team:$me.team, team_id:$me.team_id, self:$me.user, self_id:$me.user_id, url:$me.url, seen:$seen,
       presence:$presence.presence, snoozing:$dnd.snoozing, snooze_until:$dnd.snooze_until,
       capped: ([$rows[] | select(.uncounted == true)] | length > 0),
       conversations: [$rows[] | {
@@ -380,6 +380,7 @@ cmd_history() {
     | {ts: (.ts // ""), user: (.user // ""), bot: (.bot_id // ""),
        username: (.username // ""), subtype: (.subtype // ""),
        reply_count: (.reply_count // 0), thread_ts: (.thread_ts // ""),
+       reactions: [((.reactions // [])[]) | {name, count}],
        text: ((.text // "") | .[0:8000])}] | reverse' <<<"$res")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
   users="$(resolve_users "$uids")"
@@ -430,6 +431,7 @@ cmd_thread() {
     | {ts: (.ts // ""), user: (.user // ""), bot: (.bot_id // ""),
        username: (.username // ""), subtype: (.subtype // ""),
        reply_count: (.reply_count // 0), thread_ts: (.thread_ts // ""),
+       reactions: [((.reactions // [])[]) | {name, count}],
        text: ((.text // "") | .[0:8000])}]' <<<"$res")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
   users="$(resolve_users "$uids")"

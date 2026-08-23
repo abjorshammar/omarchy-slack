@@ -272,20 +272,31 @@ function buildMessages(payload, selfId) {
   var users = (payload && payload.users) || {}
   var out = []
   var prevUser = null
+  var prevDay = ""
   for (var i = 0; i < msgs.length; i++) {
     var m = msgs[i]
     var uid = String(m.user || "")
     var name = userName(users, uid) || String(m.username || "") || (m.bot ? "bot" : uid || "?")
     var text = formatMessage(m.text, users)
+    var dk = dayKey(m.ts)
+    var daySep = (dk !== "" && dk !== prevDay) ? dayLabelFor(m.ts) : ""
+    // A new day also breaks message grouping.
+    var grouped = uid !== "" && uid === prevUser && daySep === ""
+    // Reactions → display chips; :name: maps to unicode where known.
+    var reactions = []
+    var rawR = m.reactions || []
+    for (var r = 0; r < rawR.length && r < 12; r++) {
+      reactions.push({ label: emojify(":" + rawR[r].name + ":"), count: parseInt(rawR[r].count, 10) || 0 })
+    }
     out.push({
       ts: String(m.ts || ""),
       name: name,
       avatar: userAvatar(users, uid),
       mine: selfId !== "" && uid === selfId,
       system: String(m.subtype || "") !== "" && String(m.subtype || "") !== "bot_message",
-      // Group consecutive messages from the same author: hide the repeated
-      // name/avatar header on all but the first.
-      grouped: uid !== "" && uid === prevUser,
+      grouped: grouped,
+      daySep: daySep,
+      reactions: reactions,
       replyCount: parseInt(m.reply_count, 10) || 0,
       threadTs: String(m.thread_ts || ""),
       time: msgTime(m.ts),
@@ -293,6 +304,7 @@ function buildMessages(payload, selfId) {
       text: text
     })
     prevUser = uid
+    prevDay = dk
   }
   return out
 }
@@ -310,10 +322,30 @@ function msgTime(ts) {
   var t = parseFloat(ts)
   if (!t || isNaN(t)) return ""
   var d = new Date(t * 1000)
+  return ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2)
+}
+
+var DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+// "Today" / "Yesterday" / "Mon, Aug 18" for a date separator.
+function dayLabelFor(ts) {
+  var t = parseFloat(ts)
+  if (!t || isNaN(t)) return ""
+  var d = new Date(t * 1000)
   var now = new Date()
-  var hm = ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2)
-  if (d.toDateString() === now.toDateString()) return hm
-  return MONTHS[d.getMonth()] + " " + d.getDate() + " " + hm
+  var today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  var that = new Date(d.getFullYear(), d.getMonth(), d.getDate())
+  var diff = Math.round((today - that) / 86400000)
+  if (diff === 0) return "Today"
+  if (diff === 1) return "Yesterday"
+  return DAYS[d.getDay()] + ", " + MONTHS[d.getMonth()] + " " + d.getDate()
+}
+
+function dayKey(ts) {
+  var t = parseFloat(ts)
+  if (!t || isNaN(t)) return ""
+  var d = new Date(t * 1000)
+  return d.getFullYear() + "-" + d.getMonth() + "-" + d.getDate()
 }
 
 function snoozeLabel(until) {
@@ -357,6 +389,7 @@ if (typeof module !== "undefined") {
     buildMessages: buildMessages,
     lastTs: lastTs,
     msgTime: msgTime,
+    dayLabelFor: dayLabelFor,
     snoozeLabel: snoozeLabel
   }
 }

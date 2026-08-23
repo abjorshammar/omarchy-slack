@@ -32,6 +32,7 @@ Item {
   // tokenState: unknown | none | invalid | valid
   property string tokenState: "unknown"
   property string teamName: ""
+  property string teamId: ""
   property string selfName: ""
   property string selfId: ""
 
@@ -140,6 +141,7 @@ Item {
     countsError = ""
     selfId = String(data.self_id || "")
     if (data.team) teamName = String(data.team)
+    if (data.team_id) teamId = String(data.team_id)
     if (data.seen) seenMap = data.seen
   }
 
@@ -180,6 +182,12 @@ Item {
   function openUrl(u) {
     if (u && /^https?:\/\//i.test(String(u)))
       Quickshell.execDetached(["xdg-open", String(u)])
+  }
+
+  // Open the current conversation in the real Slack client / web app.
+  function openInSlack() {
+    if (teamId !== "" && convo)
+      openUrl("https://app.slack.com/client/" + teamId + "/" + convo.id)
   }
 
   // Keyboard message selection within the open conversation / thread.
@@ -590,6 +598,22 @@ Item {
             event.accepted = true
           } else if (inConvo && event.key === Qt.Key_T) {
             root.openThreadSelected()
+            event.accepted = true
+          } else if (inConvo && event.key === Qt.Key_G) {
+            if (event.modifiers & Qt.ShiftModifier) {
+              root.selectedMsg = root.displayMessages.length - 1
+              messageList.positionViewAtEnd()
+            } else {
+              root.selectedMsg = 0
+              messageList.positionViewAtBeginning()
+            }
+            event.accepted = true
+          } else if (inConvo && event.key === Qt.Key_PageDown) {
+            messageList.contentY = Math.min(messageList.contentHeight - messageList.height,
+              messageList.contentY + messageList.height * 0.9)
+            event.accepted = true
+          } else if (inConvo && event.key === Qt.Key_PageUp) {
+            messageList.contentY = Math.max(0, messageList.contentY - messageList.height * 0.9)
             event.accepted = true
           } else if (event.key === Qt.Key_Question
                      || (event.key === Qt.Key_Slash && event.modifiers === Qt.ControlModifier)) {
@@ -1450,9 +1474,50 @@ Item {
                 width: parent.width - Style.space(60) - (root.threadTs !== "" ? threadBack.width : 0)
               }
 
+              // Open this conversation in the real Slack app.
+              Rectangle {
+                id: openSlackBtn
+                visible: root.teamId !== "" && root.convo !== null
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                width: openSlackRow.implicitWidth + Style.space(12)
+                height: Style.space(20)
+                radius: root.cornerRadius
+                color: openSlackArea.containsMouse ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+                border.width: 1
+                border.color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.4)
+                Row {
+                  id: openSlackRow
+                  anchors.centerIn: parent
+                  spacing: Style.space(4)
+                  Text {
+                    text: ""  // nf-fa-slack
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Math.max(8, Style.font.caption - 1)
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                  Text {
+                    text: "open in Slack"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Math.max(8, Style.font.caption - 1)
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+                MouseArea {
+                  id: openSlackArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.openInSlack()
+                }
+              }
+
               Text {
                 textFormat: Text.PlainText
-                anchors.right: parent.right
+                anchors.right: openSlackBtn.visible ? openSlackBtn.left : parent.right
+                anchors.rightMargin: openSlackBtn.visible ? Style.space(8) : 0
                 anchors.verticalCenter: parent.verticalCenter
                 text: root.threadTs !== "" ? "" : root.historyNote
                 color: root.dim
@@ -1504,12 +1569,64 @@ Item {
                   required property var modelData
                   required property int index
                   width: messageList.width
-                  implicitHeight: mrow.implicitHeight + Style.space(6)
+                  readonly property bool hasDay: md.modelData.daySep !== ""
+                  readonly property real dayH: hasDay ? Style.space(26) : 0
+                  implicitHeight: dayH + mrow.implicitHeight + Style.space(6)
                   height: implicitHeight
                   readonly property bool selected: root.selectedMsg === index
 
+                  // Date separator: a centered pill with rules either side.
+                  Item {
+                    id: daySepItem
+                    visible: md.hasDay
+                    height: md.dayH
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+
+                    Rectangle {
+                      anchors.verticalCenter: parent.verticalCenter
+                      anchors.left: parent.left
+                      anchors.right: dayPill.left
+                      anchors.rightMargin: Style.space(8)
+                      anchors.leftMargin: Style.space(6)
+                      height: 1
+                      color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.3)
+                    }
+                    Rectangle {
+                      id: dayPill
+                      anchors.centerIn: parent
+                      width: dayText.implicitWidth + Style.space(16)
+                      height: dayText.implicitHeight + Style.space(4)
+                      radius: height / 2
+                      color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.18)
+                      Text {
+                        id: dayText
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: md.modelData.daySep
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Math.max(8, Style.font.caption - 1)
+                        font.bold: true
+                      }
+                    }
+                    Rectangle {
+                      anchors.verticalCenter: parent.verticalCenter
+                      anchors.right: parent.right
+                      anchors.left: dayPill.right
+                      anchors.leftMargin: Style.space(8)
+                      anchors.rightMargin: Style.space(6)
+                      height: 1
+                      color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.3)
+                    }
+                  }
+
                   Rectangle {
-                    anchors.fill: parent
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: daySepItem.bottom
+                    anchors.bottom: parent.bottom
                     anchors.rightMargin: Style.space(2)
                     radius: root.cornerRadius
                     color: md.selected ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.14)
@@ -1520,7 +1637,7 @@ Item {
                     id: mrow
                     anchors.left: parent.left
                     anchors.right: parent.right
-                    anchors.top: parent.top
+                    anchors.top: daySepItem.bottom
                     anchors.leftMargin: Style.space(6)
                     anchors.rightMargin: Style.space(6)
                     anchors.topMargin: Style.space(3)
@@ -1677,6 +1794,45 @@ Item {
                           onClicked: root.openThread(md.modelData)
                         }
                       }
+
+                      // Emoji reactions.
+                      Flow {
+                        visible: md.modelData.reactions.length > 0
+                        width: parent.width
+                        spacing: Style.space(4)
+                        Repeater {
+                          model: md.modelData.reactions
+                          Rectangle {
+                            required property var modelData
+                            width: rxRow.implicitWidth + Style.space(10)
+                            height: rxRow.implicitHeight + Style.space(4)
+                            radius: root.cornerRadius
+                            color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.18)
+                            Row {
+                              id: rxRow
+                              anchors.centerIn: parent
+                              spacing: Style.space(3)
+                              Text {
+                                textFormat: Text.PlainText
+                                text: parent.parent.modelData.label
+                                color: root.foreground
+                                font.family: root.fontFamily
+                                font.pixelSize: Math.max(8, Style.font.caption - 1)
+                                anchors.verticalCenter: parent.verticalCenter
+                              }
+                              Text {
+                                textFormat: Text.PlainText
+                                text: parent.parent.modelData.count
+                                color: root.dim
+                                font.family: root.fontFamily
+                                font.pixelSize: Math.max(8, Style.font.caption - 1)
+                                font.bold: true
+                                anchors.verticalCenter: parent.verticalCenter
+                              }
+                            }
+                          }
+                        }
+                      }
                     }
                   }
 
@@ -1686,7 +1842,7 @@ Item {
                     width: Style.space(20)
                     height: Style.space(20)
                     radius: Math.min(4, Style.cornerRadius)
-                    anchors.top: parent.top
+                    anchors.top: daySepItem.bottom
                     anchors.right: parent.right
                     anchors.rightMargin: Style.space(4)
                     anchors.topMargin: Style.space(2)
@@ -1844,6 +2000,8 @@ Item {
                 { k: "y", d: "Copy selected message" },
                 { k: "o", d: "Open link in selected message" },
                 { k: "t", d: "Open thread on selected message" },
+                { k: "g / G", d: "Jump to first / last message" },
+                { k: "PgUp / PgDn", d: "Scroll messages" },
                 { k: "i", d: "Jump to the message box" },
                 { k: "Esc", d: "Close thread / back to list / close app" },
                 { k: "?  or  Ctrl+/", d: "Toggle this help" }

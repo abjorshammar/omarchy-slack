@@ -12,8 +12,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-slack"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-slack"
 TOKEN_FILE="$CONFIG_DIR/token"
-USERS_CACHE="$CACHE_DIR/users.json"
+USERS_CACHE="$CACHE_DIR/users-v2.json"   # v2: values are {n,i}, i is a local PNG path
 SEEN_FILE="$CACHE_DIR/seen.json"
+AVATAR_DIR="$CACHE_DIR/avatars"
 API="https://slack.com/api"
 
 # Bounds. Slack method responses are small; the caps exist so a hostile or
@@ -199,13 +200,34 @@ load_users_cache() {
 }
 
 # Slack avatars come from these hosts only; anything else is dropped so a
-# tampered response can't point an <Image> at an arbitrary URL.
+# tampered response can't point curl at an arbitrary URL.
 valid_avatar() { [[ "$1" =~ ^https://(secure\.gravatar\.com|[a-z0-9.-]*\.slack-edge\.com)/ ]]; }
+
+# Slack serves avatars as .webp, which Qt here can't decode. Download the
+# avatar (https-pinned, size-capped) and convert it to a small local PNG that
+# Qt renders natively; cache per user id. Echoes the local PNG path, or
+# nothing on failure. Only ever fetches from validated Slack hosts.
+cache_avatar() {
+  local uid="$1" url="$2" out="$AVATAR_DIR/$uid.png" tmp
+  [[ "$uid" =~ ^[UW][A-Z0-9]{5,30}$ ]] || return 1
+  [[ -s "$out" ]] && { printf '%s' "$out"; return 0; }
+  valid_avatar "$url" || return 1
+  command -v magick >/dev/null 2>&1 || return 1
+  mkdir -p "$AVATAR_DIR" 2>/dev/null || return 1
+  tmp="$(mktemp "$out.XXXXXX")" || return 1
+  # Force JPEG output (this Qt build decodes jpeg via libqjpeg) regardless of
+  # the source format (Slack serves webp, which Qt can't read).
+  if "${CURL[@]}" --max-time 10 "$url" -o "$tmp.src" 2>/dev/null \
+     && magick "$tmp.src" -resize 72x72^ -gravity center -extent 72x72 "jpg:$tmp" 2>/dev/null; then
+    mv "$tmp" "$out"; rm -f "$tmp.src"; printf '%s' "$out"; return 0
+  fi
+  rm -f "$tmp" "$tmp.src" 2>/dev/null; return 1
+}
 
 # resolve_users <json array of user ids> — fetches at most MAX_USER_LOOKUPS
 # unknown ids, merges into the cache, prints the full cache object.
 resolve_users() {
-  local ids="$1" cache missing uid info name img fetched=0
+  local ids="$1" cache missing uid info name img local_av fetched=0
   cache="$(load_users_cache)"
   missing="$(jq -cr --argjson cache "$cache" '[.[] | select($cache[.] == null)] | unique | .[]' <<<"$ids" 2>/dev/null)"
   while IFS= read -r uid; do
@@ -219,8 +241,8 @@ resolve_users() {
     [[ -z "$name" ]] && continue
     name="${name:0:80}"
     img="$(jq -r '.user.profile.image_72 // .user.profile.image_48 // ""' <<<"$info" 2>/dev/null)"
-    valid_avatar "$img" || img=""
-    cache="$(jq -c --arg id "$uid" --arg n "$name" --arg i "$img" '.[$id] = {n:$n, i:$i}' <<<"$cache")"
+    local_av="$(cache_avatar "$uid" "$img")" || local_av=""
+    cache="$(jq -c --arg id "$uid" --arg n "$name" --arg i "$local_av" '.[$id] = {n:$n, i:$i}' <<<"$cache")"
   done <<<"$missing"
   # Bound the cache: 80-char names above, 400 entries here.
   cache="$(jq -c 'to_entries | .[-400:] | from_entries' <<<"$cache")"
@@ -352,9 +374,12 @@ cmd_history() {
   fi
 
   local msgs uids users out tmp
+  # reply_count>0 marks a thread parent; thread_ts is the parent's ts. Only
+  # top-level messages are kept here (replies are shown via `thread`).
   msgs="$(jq -c '[.messages[]? | select(.type == "message")
     | {ts: (.ts // ""), user: (.user // ""), bot: (.bot_id // ""),
        username: (.username // ""), subtype: (.subtype // ""),
+       reply_count: (.reply_count // 0), thread_ts: (.thread_ts // ""),
        text: ((.text // "") | .[0:8000])}] | reverse' <<<"$res")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
   users="$(resolve_users "$uids")"
@@ -365,23 +390,85 @@ cmd_history() {
   printf '%s\n' "$out"
 }
 
+# ---------------------------------------------------------------- thread
+
+# thread <channel> <thread_ts> — replies in a thread (conversations.replies).
+# Same output shape as history (messages + users + avatars), cached per
+# channel+ts on the same 60s budget.
+cmd_thread() {
+  require_token
+  local id="${1:-}" ts="${2:-}"
+  valid_channel "$id" || emit_error "bad channel id"
+  valid_ts "$ts" || emit_error "bad ts"
+
+  local cache_file="$CACHE_DIR/thread-$id-$ts.json" now age
+  now="$(date +%s)"
+  if [[ -s "$cache_file" ]]; then
+    age=$(( now - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0) ))
+    if (( age < HISTORY_CACHE_SECS )); then
+      jq -c '. + {cached:true}' "$cache_file" 2>/dev/null && exit 0
+    fi
+  fi
+
+  local res
+  res="$(api_call conversations.replies -G \
+    --data-urlencode "channel=$id" \
+    --data-urlencode "ts=$ts" \
+    --data-urlencode "limit=50")" || emit_error "network error fetching thread"
+  if ! jq -e '.ok == true' <<<"$res" >/dev/null 2>&1; then
+    local err
+    err="$(jq -r '.error // "thread failed"' <<<"$res" 2>/dev/null || echo "thread failed")"
+    if [[ "$err" == "ratelimited" && -s "$cache_file" ]]; then
+      jq -c '. + {cached:true, ratelimited:true}' "$cache_file" 2>/dev/null && exit 0
+    fi
+    emit_error "$err"
+  fi
+
+  local msgs uids users out tmp
+  # conversations.replies returns the parent first then replies, oldest→newest.
+  msgs="$(jq -c '[.messages[]? | select(.type == "message")
+    | {ts: (.ts // ""), user: (.user // ""), bot: (.bot_id // ""),
+       username: (.username // ""), subtype: (.subtype // ""),
+       reply_count: (.reply_count // 0), thread_ts: (.thread_ts // ""),
+       text: ((.text // "") | .[0:8000])}]' <<<"$res")"
+  uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
+  users="$(resolve_users "$uids")"
+  out="$(jq -cn --arg ch "$id" --arg ts "$ts" --argjson m "$msgs" --argjson u "$users" \
+    '{ok:true, channel:$ch, thread_ts:$ts, messages:$m, users:$u}')"
+  tmp="$(mktemp "$cache_file.XXXXXX")" && printf '%s' "$out" > "$tmp" && mv "$tmp" "$cache_file"
+  printf '%s\n' "$out"
+}
+
 # ----------------------------------------------------------------------- send
 
 cmd_send() {
   require_token
-  local id="${1:-}"
+  local id="${1:-}" thread_ts="${2:-}"
   valid_channel "$id" || emit_error "bad channel id"
+  # Optional thread_ts: reply into a thread instead of the channel root.
+  local body_base
+  if [[ -n "$thread_ts" ]]; then
+    valid_ts "$thread_ts" || emit_error "bad thread ts"
+  fi
   local text
   text="$(head -c $((MAX_MSG_CHARS * 4)) | head -c "$MAX_MSG_CHARS")"
   [[ -z "${text//[$' \t\r\n']/}" ]] && emit_error "empty message"
 
+  if [[ -n "$thread_ts" ]]; then
+    body_base="$(jq -cn --arg ch "$id" --arg t "$text" --arg tt "$thread_ts" '{channel:$ch, text:$t, thread_ts:$tt}')"
+  else
+    body_base="$(jq -cn --arg ch "$id" --arg t "$text" '{channel:$ch, text:$t}')"
+  fi
   local res
-  res="$(jq -cn --arg ch "$id" --arg t "$text" '{channel:$ch, text:$t}' \
+  res="$(printf '%s' "$body_base" \
     | api_call chat.postMessage -X POST -H 'Content-Type: application/json; charset=utf-8' --data-binary @-)" \
     || emit_error "network error sending message"
   jq -c '{ok:.ok, error:(.error // ""), ts:(.ts // "")}' <<<"$res" 2>/dev/null || emit_error "unexpected reply"
-  # A successful send makes the cached history stale immediately.
-  jq -e '.ok == true' <<<"$res" >/dev/null 2>&1 && rm -f "$CACHE_DIR/hist-$id.json"
+  # A successful send makes the cached history/thread stale immediately.
+  if jq -e '.ok == true' <<<"$res" >/dev/null 2>&1; then
+    rm -f "$CACHE_DIR/hist-$id.json"
+    [[ -n "$thread_ts" ]] && rm -f "$CACHE_DIR/thread-$id-$thread_ts.json"
+  fi
   exit 0
 }
 
@@ -464,6 +551,7 @@ cmd_status() {
 case "${1:-}" in
   counts)          shift; cmd_counts "$@" ;;
   history)         shift; cmd_history "$@" ;;
+  thread)          shift; cmd_thread "$@" ;;
   send)            shift; cmd_send "$@" ;;
   seen)            shift; cmd_seen "$@" ;;
   presence)        shift; cmd_presence "$@" ;;

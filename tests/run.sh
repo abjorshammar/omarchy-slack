@@ -26,12 +26,22 @@ cat > "$STUB_BIN/curl" <<'STUB'
 printf '%s\n' "ARGV: $*" >> "$CURL_LOG"
 url=""
 body=""
+outfile=""
+avurl=""
 prev=""
 for a in "$@"; do
   case "$a" in https://slack.com/api/*) url="$a" ;; esac
+  case "$a" in https://*.slack-edge.com/*|https://secure.gravatar.com/*) avurl="$a" ;; esac
+  if [[ "$prev" == "-o" ]]; then outfile="$a"; fi
   if [[ "$prev" == "--data-binary" || "$prev" == "-d" ]]; then body="$a"; fi
   prev="$a"
 done
+# Avatar download: emit a real, valid image so cache_avatar's magick convert
+# works (magick generates it to guarantee valid PNG data).
+if [[ -n "$avurl" && -n "$outfile" ]]; then
+  magick -size 8x8 xc:'#3366cc' "png:$outfile" 2>/dev/null || printf 'x' > "$outfile"
+  exit 0
+fi
 if [[ "$body" == "@-" ]]; then body="$(cat)"; fi
 [[ -n "$body" ]] && printf '%s\n' "BODY: $body" >> "$CURL_BODY_LOG"
 method="${url##*/api/}"
@@ -61,8 +71,13 @@ case "$method" in
   conversations.history)
     if [[ -n "${FAKE_RATELIMIT:-}" ]]; then echo '{"ok":false,"error":"ratelimited"}'; exit 0; fi
     echo '{"ok":true,"messages":[
-      {"type":"message","ts":"1755900002.000200","user":"U2222222","text":"newest <b>bold</b> &amp; stuff"},
+      {"type":"message","ts":"1755900002.000200","user":"U2222222","text":"newest <b>bold</b> &amp; stuff","reply_count":2,"thread_ts":"1755900002.000200"},
       {"type":"message","ts":"1755900001.000100","user":"U1111111","text":"older message"}]}' ;;
+  conversations.replies)
+    echo '{"ok":true,"messages":[
+      {"type":"message","ts":"1755900002.000200","user":"U2222222","text":"parent","reply_count":2,"thread_ts":"1755900002.000200"},
+      {"type":"message","ts":"1755900002.000300","user":"U1111111","text":"first reply :tada:","thread_ts":"1755900002.000200"},
+      {"type":"message","ts":"1755900002.000400","user":"U2222222","text":"second reply","thread_ts":"1755900002.000200"}]}' ;;
   chat.postMessage)
     echo '{"ok":true,"channel":"D0AAAAAA1","ts":"1755900003.000300"}' ;;
   conversations.mark)
@@ -112,7 +127,7 @@ check "team name" "$(jq -r '.team' <<<"$out")" "Acme"
 check "three conversations" "$(jq -r '.conversations | length' <<<"$out")" "3"
 check "dm unread" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .unread' <<<"$out")" "3"
 check "dm name resolved" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .name' <<<"$out")" "jane.d"
-check "dm avatar resolved" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .avatar' <<<"$out")" "https://ca.slack-edge.com/T1-U2-72.png"
+check "dm avatar cached to local png" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .avatar | test("/omarchy-slack/avatars/U2222222[.]png$")' <<<"$out")" "true"
 check "channel kind" "$(jq -r '.conversations[] | select(.id=="C0BBBBBB2") | .kind' <<<"$out")" "channel"
 check "presence" "$(jq -r '.presence' <<<"$out")" "active"
 
@@ -130,7 +145,9 @@ check "history ok" "$(jq -r '.ok' <<<"$out")" "true"
 check "history names its channel" "$(jq -r '.channel' <<<"$out")" "D0AAAAAA1"
 check "chronological order" "$(jq -r '.messages[0].ts' <<<"$out")" "1755900001.000100"
 check "user map present (name)" "$(jq -r '.users.U2222222.n' <<<"$out")" "jane.d"
-check "avatar captured from slack-edge" "$(jq -r '.users.U2222222.i' <<<"$out")" "https://ca.slack-edge.com/T1-U2-72.png"
+check "history exposes reply_count" "$(jq -r '.messages[] | select(.ts=="1755900002.000200") | .reply_count' <<<"$out")" "2"
+check "history exposes thread_ts" "$(jq -r '.messages[] | select(.ts=="1755900002.000200") | .thread_ts' <<<"$out")" "1755900002.000200"
+check "avatar cached to local png" "$(jq -r '.users.U2222222.i | test("/omarchy-slack/avatars/U2222222[.]png$")' <<<"$out")" "true"
 n_before="$(grep -c conversations.history "$CURL_LOG")"
 out="$(run history D0AAAAAA1)"
 n_after="$(grep -c conversations.history "$CURL_LOG")"
@@ -148,6 +165,22 @@ touch -d '5 minutes ago' "$XDG_CACHE_HOME/omarchy-slack/hist-D0AAAAAA1.json"
 out="$(FAKE_RATELIMIT=1 run history D0AAAAAA1)"
 check "ratelimited falls back to stale cache" "$(jq -r '.ok' <<<"$out")" "true"
 check "fallback flagged ratelimited" "$(jq -r '.ratelimited' <<<"$out")" "true"
+
+echo "== threads"
+out="$(run thread D0AAAAAA1 1755900002.000200)"
+check "thread ok" "$(jq -r '.ok' <<<"$out")" "true"
+check "thread names its channel" "$(jq -r '.channel' <<<"$out")" "D0AAAAAA1"
+check "thread carries thread_ts" "$(jq -r '.thread_ts' <<<"$out")" "1755900002.000200"
+check "thread has parent + 2 replies" "$(jq -r '.messages | length' <<<"$out")" "3"
+check "thread reply order (parent first)" "$(jq -r '.messages[0].text' <<<"$out")" "parent"
+out="$(run thread D0AAAAAA1 'bad;ts')"
+check "thread rejects bad ts" "$(jq -r '.ok' <<<"$out")" "false"
+# reply into a thread: send with a thread_ts adds thread_ts to the body
+printf 'a threaded reply' | run send D0AAAAAA1 1755900002.000200 >/dev/null
+body="$(grep '^BODY: ' "$CURL_BODY_LOG" | tail -1 | sed 's/^BODY: //')"
+check "threaded send includes thread_ts" "$(jq -r '.thread_ts' <<<"$body")" "1755900002.000200"
+out="$(printf 'hi' | run send D0AAAAAA1 'bad;ts')"
+check "threaded send rejects bad thread ts" "$(jq -r '.ok' <<<"$out")" "false"
 
 echo "== send"
 out="$(printf "hello 'world' \"quotes\" \$(dangerous) \`bits\`" | run send D0AAAAAA1)"

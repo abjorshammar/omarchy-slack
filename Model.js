@@ -23,8 +23,14 @@ function historyCommand(scriptDir, channelId) {
   return ["bash", script(scriptDir), "history", String(channelId)]
 }
 
-function sendCommand(scriptDir, channelId) {
-  return ["bash", script(scriptDir), "send", String(channelId)]
+function sendCommand(scriptDir, channelId, threadTs) {
+  var a = ["bash", script(scriptDir), "send", String(channelId)]
+  if (threadTs) a.push(String(threadTs))
+  return a
+}
+
+function threadCommand(scriptDir, channelId, ts) {
+  return ["bash", script(scriptDir), "thread", String(channelId), String(ts)]
 }
 
 function seenCommand(scriptDir, channelId, ts) {
@@ -195,9 +201,20 @@ function userAvatar(users, id) {
   return validAvatar(u.i) ? u.i : ""
 }
 
-// Avatars are only ever loaded from Slack's own image hosts.
-function validAvatar(url) {
-  return /^https:\/\/(secure\.gravatar\.com|[a-z0-9.-]*\.slack-edge\.com)\//.test(String(url || ""))
+// Avatars are either a local PNG the script converted (Slack serves webp,
+// which Qt can't decode) under the plugin's own cache dir, or — as a
+// fallback — a URL on Slack's own image hosts. Nothing else is accepted.
+function validAvatar(x) {
+  var s = String(x || "")
+  return /\/omarchy-slack\/avatars\/[UW][A-Z0-9]+\.png$/.test(s)
+      || /^https:\/\/(secure\.gravatar\.com|[a-z0-9.-]*\.slack-edge\.com)\//.test(s)
+}
+
+// Image.source value for an avatar: file:// for the local PNG, the https URL
+// otherwise, or "" when there's nothing valid to show.
+function avatarSource(x) {
+  if (!validAvatar(x)) return ""
+  return String(x).charAt(0) === "/" ? "file://" + x : String(x)
 }
 
 // A small map of the mrkdwn emoji shortcodes that show up most in practice.
@@ -269,6 +286,8 @@ function buildMessages(payload, selfId) {
       // Group consecutive messages from the same author: hide the repeated
       // name/avatar header on all but the first.
       grouped: uid !== "" && uid === prevUser,
+      replyCount: parseInt(m.reply_count, 10) || 0,
+      threadTs: String(m.thread_ts || ""),
       time: msgTime(m.ts),
       url: firstUrl(text),
       text: text
@@ -309,6 +328,7 @@ if (typeof module !== "undefined") {
     countsCommand: countsCommand,
     historyCommand: historyCommand,
     sendCommand: sendCommand,
+    threadCommand: threadCommand,
     seenCommand: seenCommand,
     loginCommand: loginCommand,
     loginAvailableCommand: loginAvailableCommand,
@@ -330,6 +350,7 @@ if (typeof module !== "undefined") {
     formatMessage: formatMessage,
     emojify: emojify,
     validAvatar: validAvatar,
+    avatarSource: avatarSource,
     userName: userName,
     userAvatar: userAvatar,
     firstUrl: firstUrl,

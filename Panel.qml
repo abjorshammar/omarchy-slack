@@ -72,6 +72,14 @@ Item {
   property string flash: ""
   property bool showShortcuts: false
 
+  // Thread view: threadTs != "" means the message pane is showing a thread's
+  // replies instead of the conversation root.
+  property string threadTs: ""
+  property var threadMessages: []
+  property bool threadLoading: false
+  property string threadError: ""
+  readonly property var displayMessages: threadTs !== "" ? threadMessages : messages
+
   // ------------------------------------------------------ overlay contract
 
   function open(payloadJson) {
@@ -174,24 +182,67 @@ Item {
       Quickshell.execDetached(["xdg-open", String(u)])
   }
 
-  // Keyboard message selection within the open conversation.
+  // Keyboard message selection within the open conversation / thread.
   function selectMsg(step) {
-    if (!convo || messages.length === 0) return
+    var msgs = displayMessages
+    if (!convo || msgs.length === 0) return
     var at = selectedMsg
-    if (at < 0) at = step > 0 ? 0 : messages.length - 1
-    else at = Math.min(messages.length - 1, Math.max(0, at + step))
+    if (at < 0) at = step > 0 ? 0 : msgs.length - 1
+    else at = Math.min(msgs.length - 1, Math.max(0, at + step))
     selectedMsg = at
     Qt.callLater(function() { messageList.positionViewAtIndex(at, ListView.Contain) })
   }
 
   function copySelected() {
-    var i = selectedMsg >= 0 ? selectedMsg : messages.length - 1
-    if (i >= 0 && i < messages.length) copyText(messages[i].text)
+    var msgs = displayMessages
+    var i = selectedMsg >= 0 ? selectedMsg : msgs.length - 1
+    if (i >= 0 && i < msgs.length) copyText(msgs[i].text)
   }
 
   function openSelected() {
-    var i = selectedMsg >= 0 ? selectedMsg : messages.length - 1
-    if (i >= 0 && i < messages.length && messages[i].url) openUrl(messages[i].url)
+    var msgs = displayMessages
+    var i = selectedMsg >= 0 ? selectedMsg : msgs.length - 1
+    if (i >= 0 && i < msgs.length && msgs[i].url) openUrl(msgs[i].url)
+  }
+
+  // ---- threads ----
+  function openThread(m) {
+    if (!convo || !m) return
+    var tts = m.threadTs && m.threadTs !== "" ? m.threadTs : m.ts
+    if (!tts) return
+    threadTs = tts
+    threadMessages = []
+    threadError = ""
+    threadLoading = true
+    selectedMsg = -1
+    if (threadProc.running) threadProc.running = false
+    threadProc.cmd = Model.threadCommand(scriptDir, convo.id, tts)
+    threadProc.running = true
+  }
+
+  function openThreadSelected() {
+    if (threadTs !== "") return
+    var i = selectedMsg
+    if (i >= 0 && i < messages.length && (messages[i].replyCount > 0 || messages[i].threadTs !== ""))
+      openThread(messages[i])
+  }
+
+  function closeThread() {
+    threadTs = ""
+    threadMessages = []
+    threadError = ""
+    selectedMsg = -1
+  }
+
+  function applyThread(raw) {
+    threadLoading = false
+    var data = Model.parseJson(raw)
+    if (!convo || (data.channel && data.channel !== convo.id)) return
+    if (data.thread_ts && data.thread_ts !== threadTs) return
+    if (!data.ok) { threadError = Model.friendlyError(data.error); return }
+    threadError = ""
+    threadMessages = Model.buildMessages(data, selfId)
+    Qt.callLater(function() { messageList.positionViewAtEnd() })
   }
 
   // Records the read marker (shared with the bar badge via seen.json) and
@@ -209,6 +260,8 @@ Item {
     settingsMode = false
     convo = { id: c.id, name: Model.displayName(c), kind: c.kind }
     selectedMsg = -1
+    threadTs = ""
+    threadMessages = []
     messages = []
     historyError = ""
     historyNote = ""
@@ -234,8 +287,10 @@ Item {
     sending = true
     sendError = ""
     // Snapshot the destination now — a live binding could re-resolve to a
-    // different conversation between here and process start.
-    sendProc.cmd = Model.sendCommand(scriptDir, convo.id)
+    // different conversation between here and process start. In a thread,
+    // reply into it (thread_ts).
+    sendProc.cmd = Model.sendCommand(scriptDir, convo.id, threadTs !== "" ? threadTs : "")
+    sendProc.intoThread = threadTs !== ""
     sendProc.pendingText = String(text)
     sendProc.stdinEnabled = true
     sendProc.running = true
@@ -249,16 +304,24 @@ Item {
       return
     }
     // Append locally instead of refetching — history is 1 request/minute.
-    var mine = messages.slice()
-    mine.push({
+    var row = {
       ts: String(data.ts || ""),
       name: selfName || "me",
+      avatar: "",
       mine: true,
       system: false,
+      grouped: false,
+      replyCount: 0,
+      threadTs: sendProc.intoThread ? threadTs : "",
       time: Qt.formatTime(new Date(), "HH:mm"),
+      url: "",
       text: Model.formatMessage(sendProc.pendingText, {})
-    })
-    messages = mine
+    }
+    if (sendProc.intoThread) {
+      var t = threadMessages.slice(); t.push(row); threadMessages = t
+    } else {
+      var mine = messages.slice(); mine.push(row); messages = mine
+    }
     composeField.text = ""
     if (convo && data.ts) markSeen(convo.id, String(data.ts))
     scrollToBottom()
@@ -400,11 +463,22 @@ Item {
     }
   }
 
+  Process {
+    id: threadProc
+    property var cmd: ["true"]
+    command: cmd
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyThread(text)
+    }
+  }
+
   // Message text travels over stdin — never argv — so arbitrary user text
   // stays out of every process list and shell parser.
   Process {
     id: sendProc
     property string pendingText: ""
+    property bool intoThread: false
     property var cmd: ["true"]
     command: cmd
     stdinEnabled: true
@@ -510,8 +584,12 @@ Item {
             return
           }
           if (event.key === Qt.Key_Escape) {
-            if (inConvo) root.backToList()
+            if (root.threadTs !== "") root.closeThread()
+            else if (inConvo) root.backToList()
             else root.dismiss()
+            event.accepted = true
+          } else if (inConvo && event.key === Qt.Key_T) {
+            root.openThreadSelected()
             event.accepted = true
           } else if (event.key === Qt.Key_Question
                      || (event.key === Qt.Key_Slash && event.modifiers === Qt.ControlModifier)) {
@@ -1053,7 +1131,7 @@ Item {
                       Image {
                         id: dmImg
                         anchors.fill: parent
-                        source: Model.validAvatar(dmRow.modelData.avatar) ? dmRow.modelData.avatar : ""
+                        source: Model.avatarSource(dmRow.modelData.avatar)
                         sourceSize.width: 48
                         sourceSize.height: 48
                         fillMode: Image.PreserveAspectCrop
@@ -1323,26 +1401,60 @@ Item {
               width: parent.width
               height: Style.space(24)
 
-              Text {
-                textFormat: Text.PlainText
+              // "‹ back" appears when viewing a thread; returns to the convo.
+              Rectangle {
+                id: threadBack
+                visible: root.threadTs !== ""
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
+                width: threadBackRow.implicitWidth + Style.space(10)
+                height: Style.space(20)
+                radius: root.cornerRadius
+                color: threadBackArea.containsMouse ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+                Row {
+                  id: threadBackRow
+                  anchors.centerIn: parent
+                  spacing: Style.space(3)
+                  Text {
+                    text: "‹"; color: root.dim; font.family: root.fontFamily
+                    font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter
+                  }
+                  Text {
+                    text: "Thread"; color: root.dim; font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption; font.bold: true; font.letterSpacing: 1
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+                MouseArea {
+                  id: threadBackArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.closeThread()
+                }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                anchors.left: root.threadTs !== "" ? threadBack.right : parent.left
+                anchors.leftMargin: root.threadTs !== "" ? Style.space(8) : 0
+                anchors.verticalCenter: parent.verticalCenter
                 text: root.convo
-                  ? (root.convo.kind === "im" || root.convo.kind === "mpim" ? "@ " : "# ") + root.convo.name
+                  ? (root.threadTs !== "" ? "🧵 " : (root.convo.kind === "im" || root.convo.kind === "mpim" ? "@ " : "# ")) + root.convo.name
                   : ""
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
                 font.bold: true
                 elide: Text.ElideRight
-                width: parent.width - Style.space(60)
+                width: parent.width - Style.space(60) - (root.threadTs !== "" ? threadBack.width : 0)
               }
 
               Text {
                 textFormat: Text.PlainText
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                text: root.historyNote
+                text: root.threadTs !== "" ? "" : root.historyNote
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Math.max(8, Style.font.caption - 1)
@@ -1358,8 +1470,8 @@ Item {
               Text {
                 textFormat: Text.PlainText
                 anchors.centerIn: parent
-                visible: root.historyLoading && root.messages.length === 0
-                text: "loading messages…"
+                visible: (root.threadTs !== "" ? root.threadLoading : root.historyLoading) && root.displayMessages.length === 0
+                text: root.threadTs !== "" ? "loading thread…" : "loading messages…"
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -1369,8 +1481,8 @@ Item {
                 textFormat: Text.PlainText
                 anchors.centerIn: parent
                 width: parent.width - Style.space(40)
-                visible: root.historyError !== ""
-                text: "⚠ " + root.historyError
+                visible: (root.threadTs !== "" ? root.threadError : root.historyError) !== ""
+                text: "⚠ " + (root.threadTs !== "" ? root.threadError : root.historyError)
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -1381,7 +1493,7 @@ Item {
               ListView {
                 id: messageList
                 anchors.fill: parent
-                model: root.messages
+                model: root.displayMessages
                 clip: true
                 spacing: Style.space(3)
                 boundsBehavior: Flickable.StopAtBounds
@@ -1439,7 +1551,7 @@ Item {
                         Image {
                           id: mImg
                           anchors.fill: parent
-                          source: Model.validAvatar(md.modelData.avatar) ? md.modelData.avatar : ""
+                          source: Model.avatarSource(md.modelData.avatar)
                           sourceSize.width: 64
                           sourceSize.height: 64
                           fillMode: Image.PreserveAspectCrop
@@ -1524,6 +1636,47 @@ Item {
                           onClicked: root.openUrl(md.modelData.url)
                         }
                       }
+
+                      // Thread affordance: "N replies" on a parent message
+                      // (only in the conversation view, not inside a thread).
+                      Rectangle {
+                        visible: root.threadTs === "" && md.modelData.replyCount > 0
+                        width: threadRow.implicitWidth + Style.space(12)
+                        height: threadRow.implicitHeight + Style.space(6)
+                        radius: root.cornerRadius
+                        color: threadArea.containsMouse ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+                        border.width: 1
+                        border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.5)
+
+                        Row {
+                          id: threadRow
+                          anchors.centerIn: parent
+                          spacing: Style.space(5)
+                          Text {
+                            text: ""  // nf-fa-comments
+                            color: Color.accent
+                            font.family: root.fontFamily
+                            font.pixelSize: Math.max(8, Style.font.caption - 1)
+                            anchors.verticalCenter: parent.verticalCenter
+                          }
+                          Text {
+                            textFormat: Text.PlainText
+                            text: md.modelData.replyCount + (md.modelData.replyCount === 1 ? " reply" : " replies")
+                            color: Color.accent
+                            font.family: root.fontFamily
+                            font.pixelSize: Math.max(8, Style.font.caption - 1)
+                            font.bold: true
+                            anchors.verticalCenter: parent.verticalCenter
+                          }
+                        }
+                        MouseArea {
+                          id: threadArea
+                          anchors.fill: parent
+                          hoverEnabled: true
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.openThread(md.modelData)
+                        }
+                      }
                     }
                   }
 
@@ -1578,7 +1731,7 @@ Item {
                 anchors.left: parent.left
                 anchors.right: sendButton.left
                 anchors.rightMargin: Style.space(6)
-                placeholderText: root.sending ? "sending…" : "Message… (Enter to send)"
+                placeholderText: root.sending ? "sending…" : (root.threadTs !== "" ? "Reply in thread… (Enter to send)" : "Message… (Enter to send)")
                 foreground: root.foreground
                 font.family: root.fontFamily
                 enabled: !root.sending
@@ -1690,8 +1843,9 @@ Item {
                 { k: "j / k", d: "Select message (down / up)" },
                 { k: "y", d: "Copy selected message" },
                 { k: "o", d: "Open link in selected message" },
+                { k: "t", d: "Open thread on selected message" },
                 { k: "i", d: "Jump to the message box" },
-                { k: "Esc", d: "Back to list / close app" },
+                { k: "Esc", d: "Close thread / back to list / close app" },
                 { k: "?  or  Ctrl+/", d: "Toggle this help" }
               ]
               Row {

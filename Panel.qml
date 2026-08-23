@@ -1,13 +1,13 @@
 import Quickshell
 import Quickshell.Io
-import Quickshell.Wayland
 import QtQuick
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// The Omarchy Slack app: a hotkey/bar-summoned overlay with a sidebar of
-// conversations and a message pane, in the shell's menu surface style.
+// The Omarchy Slack app: a movable, resizable FloatingWindow (kind: panel,
+// the same model as the Spotify plugin) with a conversation sidebar and a
+// message pane, in the shell's menu surface style.
 Item {
   id: root
 
@@ -18,16 +18,11 @@ Item {
   property color background: Color.menu.background
   property color foreground: Color.menu.text
   readonly property color dim: Qt.darker(foreground, 1.5)
-  property color border: Color.menu.border
-  property var borderSpec: Border.surfaceSpec("menu", "border", border, Math.max(1, Style.space(2)))
-  property color scrim: Color.menu.scrim
   property color selectedBackground: Color.menu.selectedBackground
   property color selectedText: Color.menu.selectedText
   readonly property int cornerRadius: Style.cornerRadius
   property string fontFamily: Style.font.menuFamily
   property int contentMargin: Style.spacing.panelPadding
-  property int cardWidth: Math.min(Style.space(960), panel.width - Style.gapsOut * 2)
-  property int cardHeight: Math.min(Style.space(640), panel.height - Style.gapsOut * 2)
   property int sidebarWidth: Style.space(250)
 
   readonly property string scriptDir: Qt.resolvedUrl("scripts/").toString().replace("file://", "")
@@ -444,45 +439,31 @@ Item {
 
   // ------------------------------------------------------------------- UI
 
-  PanelWindow {
-    id: panel
+  // A real floating, movable, resizable app window — the same model the
+  // Spotify plugin uses (kind: panel + FloatingWindow), not a modal overlay.
+  FloatingWindow {
+    id: window
     visible: root.opened
-    anchors { top: true; bottom: true; left: true; right: true }
-    color: "transparent"
-    WlrLayershell.namespace: "omarchy-slack"
-    WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
-    exclusionMode: ExclusionMode.Ignore
+    title: "Omarchy Slack"
+    color: root.background
+    implicitWidth: 980
+    implicitHeight: 720
+    minimumSize: Qt.size(700, 560)
 
-    Rectangle {
-      anchors.fill: parent
-      color: root.scrim
+    // Closing the window from the compositor (title-bar close) unwinds through
+    // the host the same way Escape does.
+    onVisibleChanged: {
+      if (!visible && root.opened) root.dismiss()
     }
 
-    MouseArea {
+    FocusScope {
+      id: keyCatcher
       anchors.fill: parent
-      onClicked: root.dismiss()
-    }
+      anchors.margins: root.contentMargin
+      focus: true
 
-    BorderSurface {
-      id: card
-      width: root.cardWidth
-      height: root.cardHeight
-      radius: root.cornerRadius
-      anchors.centerIn: parent
-      color: root.background
-      borderSpec: root.borderSpec
-      padding: root.contentMargin
-
-      MouseArea { anchors.fill: parent; onClicked: {} }
-
-      Item {
-        id: keyCatcher
-        anchors.fill: parent
-        focus: true
-
-        Keys.priority: Keys.BeforeItem
-        Keys.onPressed: function(event) {
+      Keys.priority: Keys.BeforeItem
+      Keys.onPressed: function(event) {
           if (event.key === Qt.Key_Escape) {
             root.dismiss()
             event.accepted = true
@@ -700,10 +681,6 @@ Item {
         Row {
           visible: root.tokenState === "valid"
           anchors.fill: parent
-          anchors.topMargin: card.contentTopInset
-          anchors.rightMargin: card.contentRightInset
-          anchors.bottomMargin: card.contentBottomInset
-          anchors.leftMargin: card.contentLeftInset
           spacing: root.contentMargin
 
           // ------------------------- SIDEBAR -------------------------
@@ -1405,4 +1382,3 @@ Item {
       }
     }
   }
-}

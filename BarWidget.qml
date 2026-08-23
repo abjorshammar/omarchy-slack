@@ -44,7 +44,7 @@ BarWidget {
   }
 
   function toggleApp() {
-    // The overlay is a separate entry point; the shell owns its lifecycle.
+    // The app panel is a separate entry point; the shell owns its lifecycle.
     root.bar.run("omarchy-shell shell toggle bottelet.slack")
   }
 
@@ -77,7 +77,7 @@ BarWidget {
     onTriggered: root.refresh()
   }
 
-  // seen.json is written by the app overlay as conversations are read.
+  // seen.json is written by the app panel as conversations are read.
   FileView {
     id: seenView
     path: root.seenPath

@@ -4,7 +4,8 @@
 
 Initial release.
 
-- Full Slack app as an Omarchy overlay: conversation sidebar (DMs, group
+- Full Slack app as an Omarchy `panel`: a movable, resizable FloatingWindow
+  (same model as the Spotify plugin) with a conversation sidebar (DMs, group
   DMs, channels), message view, inline replies, filter, keyboard navigation.
 - Bar widget with a mention badge (unread DMs/group DMs) and unread-channel
   indicator; click summons the app, middle-click refreshes.

@@ -8,16 +8,16 @@
   "description": "Slack as a fast, themed Omarchy app: sign in with your browser, read and reply to DMs and channels, toggle presence and Do Not Disturb — with a mention badge in your bar. No Chromium, no half-gigabyte client.",
   "kinds": [
     "bar-widget",
-    "overlay"
+    "panel"
   ],
   "keepLoaded": true,
   "entryPoints": {
     "barWidget": "BarWidget.qml",
-    "overlay": "Overlay.qml"
+    "panel": "Panel.qml"
   },
   "barWidget": {
     "displayName": "Omarchy Slack",
-    "description": "Slack icon that badges up with unread DMs; click to open the Slack app overlay",
+    "description": "Slack icon that badges up with unread DMs; click to open the Slack app window",
     "category": "Info",
     "aliases": [
       "slack",

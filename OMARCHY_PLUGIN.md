@@ -1,15 +1,17 @@
 # Omarchy Slack — Omarchy plugin
 
-Two entry points (`kinds: ["bar-widget", "overlay"]`), id `bottelet.slack`:
+Two entry points (`kinds: ["bar-widget", "panel"]`), id `bottelet.slack`:
 
 - `BarWidget.qml` — bar icon with a mention badge. Polls unread counts on its
   own timer; clicking runs `omarchy-shell shell toggle bottelet.slack` to
   summon the app. Watches `~/.cache/omarchy-slack/seen.json` so the badge
   clears the moment a conversation is read in the app.
-- `Overlay.qml` — the app (`keepLoaded`): fullscreen scrim + centered card,
+- `Panel.qml` — the app (`kind: panel`, `keepLoaded`): a real movable,
+  resizable `FloatingWindow` (the same model as the Spotify plugin) with a
   sidebar (workspace, presence, DND snooze, filter, conversations) and a chat
   pane (history, compose, settings). Also owns sign-in: browser OAuth via
-  `scripts/slack.sh login`, or a pasted token.
+  `scripts/slack.sh login`, or a pasted token. Hyprland tiles new toplevels
+  by default; add `windowrulev2 = float, title:^(Omarchy Slack)$` to float it.
 
 Shared plumbing:
 

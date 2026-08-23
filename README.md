@@ -11,8 +11,9 @@ mention badge keeps watch in your bar. No Electron, no half-gigabyte client.
 ## Features
 
 - **A full app, summoned instantly.** Click the bar icon (or bind a hotkey)
-  and Slack opens as a centered overlay: conversations in the sidebar,
-  messages and a compose box on the right. `Esc` and it's gone.
+  and Slack opens as a real, movable, resizable window (the same model as the
+  Spotify plugin): conversations in the sidebar, messages and a compose box on
+  the right. `Esc` closes it.
 - **Sign in with your browser.** One click sends you to Slack's own consent
   page; the token comes back to the plugin and goes straight into your
   system keyring. No copy-pasting API keys.
@@ -47,6 +48,15 @@ o.bind("SUPER + SHIFT + S", "Slack", "omarchy-shell shell toggle bottelet.slack"
 
 Then click the Slack icon and press **Sign in with Slack**. Your browser
 opens Slack's consent page; approve it and you're in.
+
+The app opens as a normal window. Hyprland tiles new windows by default; to
+have it float like a typical app, add to your Hyprland config:
+
+```
+windowrulev2 = float, title:^(Omarchy Slack)$
+windowrulev2 = size 980 720, title:^(Omarchy Slack)$
+windowrulev2 = center, title:^(Omarchy Slack)$
+```
 
 ## How sign-in works (and the paste-a-token fallback)
 

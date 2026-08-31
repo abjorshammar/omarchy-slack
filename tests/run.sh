@@ -259,6 +259,21 @@ check "dm avatar cached under its workspace" "$(jq -r '.conversations[] | select
 check "channel kind" "$(jq -r '.conversations[] | select(.id=="C0BBBBBB2") | .kind' <<<"$out")" "channel"
 check "presence" "$(jq -r '.presence' <<<"$out")" "active"
 
+# ImageMagick is optional — README promises bash/curl/jq/python3 only — so a
+# machine without it must still get names, unreads and conversations, just no
+# avatars. Nothing here may depend on the avatar directory being non-empty.
+echo "== without ImageMagick"
+mkdir -p "$WORK/nomagick"
+printf '#!/bin/sh\nexit 1\n' > "$WORK/nomagick/magick"
+chmod +x "$WORK/nomagick/magick"
+out="$(PATH="$WORK/nomagick:$STUB_BIN:$PATH" XDG_CACHE_HOME="$WORK/cache-nomagick" run counts)"
+check "counts works without ImageMagick" "$(jq -r '.ok' <<<"$out")" "true"
+check "conversations still listed" "$(jq -r '.conversations | length' <<<"$out")" "3"
+check "DM names still resolve" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .name' <<<"$out")" "jane.d"
+check "unreads still counted" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .unread' <<<"$out")" "3"
+check "but no avatar is claimed" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .avatar' <<<"$out")" ""
+rm -rf "$WORK/cache-nomagick"
+
 echo "== cache privacy"
 check "cache dir is 0700" "$(stat -c %a "$CACHE")" "700"
 check "workspace cache dir is 0700" "$(stat -c %a "$CACHE/$ACME")" "700"

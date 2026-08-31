@@ -52,6 +52,13 @@
   downloads are batched the same way. A warm counts cycle drops from ~9s to
   ~2s; a cold open (empty caches) from ~15s to under 4s, with ~10× fewer
   processes spawned. Output is byte-for-byte unchanged.
+- The app window and the bar badge now paint immediately on open. `counts-all`
+  keeps its last payload in `~/.cache/omarchy-slack/counts.json`, and the new
+  `counts-cached` subcommand hands it back with no network call at all
+  (~15 ms against ~2.5 s for a real poll); both entry points draw that first
+  and replace it when their own poll lands. Read markers are re-read live
+  rather than taken from the file, so a conversation read since the last poll
+  does not light up again.
 
 ## 1.0.0
 

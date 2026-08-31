@@ -132,6 +132,7 @@ Item {
   // ------------------------------------------------------------- plumbing
 
   function refreshAll() {
+    if (!countsAllData && !cachedCountsProc.running) cachedCountsProc.running = true
     if (!statusProc.running) statusProc.running = true
     if (!loginAvailProc.running) loginAvailProc.running = true
   }
@@ -165,6 +166,17 @@ Item {
     } else {
       tokenState = String(data.error || "") === "network" ? "unknown" : "invalid"
     }
+  }
+
+  // First paint: last poll's payload, off disk, before any network call has
+  // returned. Optimistically signed in — the payload only exists because a
+  // poll succeeded — and statusProc corrects that a moment later if wrong.
+  function applyCachedCounts(raw) {
+    if (countsAllData) return  // a live poll already beat us to it
+    var data = Model.parseJson(raw)
+    if (!data.ok || !data.workspaces || data.workspaces.length === 0) return
+    if (tokenState !== "valid") tokenState = "valid"
+    applyCounts(raw)
   }
 
   // One counts-all payload feeds both the rail and the active workspace.
@@ -698,6 +710,17 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyCounts(text)
+    }
+  }
+
+  // Local read of the last payload; runs alongside the status check so the
+  // window has content immediately instead of after a full fetch.
+  Process {
+    id: cachedCountsProc
+    command: Model.countsCachedCommand(root.scriptDir)
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyCachedCounts(text)
     }
   }
 

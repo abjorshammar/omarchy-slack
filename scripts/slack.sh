@@ -20,6 +20,7 @@ LEGACY_TOKEN_FILE="$CONFIG_DIR/token"     # pre-multi-workspace single token
 TOKENS_DIR="$CONFIG_DIR/tokens"           # one 0600 file per team id
 REGISTRY="$CONFIG_DIR/workspaces.json"    # metadata only — never a token
 SEEN_FILE="$CACHE_DIR/seen.json"          # global; keys are "<team>/<channel>"
+COUNTS_CACHE="$CACHE_DIR/counts.json"     # last counts-all payload, for first paint
 API="https://slack.com/api"
 
 # Per-team state, filled in by set_team_paths.
@@ -229,6 +230,9 @@ forget_token() {
   fi
   rm -f "$TOKENS_DIR/$team" 2>/dev/null
   rm -rf "${CACHE_DIR:?}/$team" 2>/dev/null
+  # The first-paint payload still names this workspace; drop it rather than
+  # flash a signed-out workspace on the next open.
+  rm -f "$COUNTS_CACHE" 2>/dev/null
   # Drop that workspace's read markers from the shared seen map.
   if [[ -s "$SEEN_FILE" ]]; then
     local s
@@ -872,10 +876,29 @@ cmd_counts_all() {
 
   # `registered` counts every workspace in the registry, polled or not, so the
   # UI can tell "one workspace" from "one being polled" without guessing.
-  jq -cn --argjson ws "$ws" --argjson seen "$(load_seen)" \
+  local payload
+  payload="$(jq -cn --argjson ws "$ws" --argjson seen "$(load_seen)" \
          --argjson registered "$(jq -c '.workspaces | length' <<<"$reg")" \
          --arg active "$(active_team || true)" \
-    '{ok:true, active:$active, registered:$registered, seen:$seen, workspaces:$ws}'
+    '{ok:true, active:$active, registered:$registered, seen:$seen, workspaces:$ws}')" || return 1
+  # Kept on disk so the next window or bar start has something to draw before
+  # its own fetch returns — see counts-cached.
+  write_atomic "$COUNTS_CACHE" "$payload" 2>/dev/null || true
+  printf '%s\n' "$payload"
+}
+
+# counts-cached — the last counts-all payload, straight off disk, no network.
+# The UI paints this the moment it opens and then polls; without it the
+# sidebar and the bar badge sit empty for the length of a full fetch.
+cmd_counts_cached() {
+  local miss='{"ok":false,"error":"no cache"}'
+  [[ -s "$COUNTS_CACHE" ]] || { printf '%s\n' "$miss"; return 0; }
+  # Read markers move locally as conversations are read, so the payload's copy
+  # of them is as old as the file. Splice the live one in, or a conversation
+  # read since the last poll would light up again on every open.
+  jq -c --argjson seen "$(load_seen)" \
+    'if .ok == true then . + {seen:$seen, cached:true} else {ok:false,error:"no cache"} end' \
+    "$COUNTS_CACHE" 2>/dev/null || printf '%s\n' "$miss"
 }
 
 # workspaces — the registry, plus whether each still has a usable token. No
@@ -1142,6 +1165,7 @@ done
 case "${1:-}" in
   counts)          shift; cmd_counts "$@" ;;
   counts-all)      shift; cmd_counts_all "$@" ;;
+  counts-cached)   shift; cmd_counts_cached ;;
   workspaces)      cmd_workspaces ;;
   use)             shift; cmd_use "$@" ;;
   history)         shift; cmd_history "$@" ;;

@@ -440,6 +440,30 @@ check "beta dm unread in aggregate" "$(jq -r '.workspaces[] | select(.team_id=="
 # What the bar badge sums: unread DMs and group DMs across every workspace.
 total="$(jq -r '[.workspaces[]? | select(.ok) | .conversations[]? | select(.kind=="im" or .kind=="mpim") | .unread] | add' <<<"$out")"
 check "aggregate dm unread across workspaces" "$total" "9"
+
+# counts-cached — what the UI paints before its own fetch returns. Purely
+# local: no request may leave, and stale read markers must not resurrect a
+# badge for a conversation read since the last poll.
+echo "== counts-cached"
+check "counts-all leaves a cache behind" "$([ -s "$CACHE/counts.json" ] && echo yes)" "yes"
+: > "$CURL_LOG"
+cached="$(run counts-cached)"
+check "counts-cached ok" "$(jq -r '.ok' <<<"$cached")" "true"
+check "counts-cached is flagged as cached" "$(jq -r '.cached' <<<"$cached")" "true"
+check "counts-cached covers both workspaces" "$(jq -r '.workspaces | length' <<<"$cached")" "2"
+check "counts-cached keeps unread counts" "$(jq -r '.workspaces[] | select(.team_id=="'"$BETA"'") | .conversations[] | select(.id=="D0BETADM1") | .unread' <<<"$cached")" "5"
+check "counts-cached makes no request" "$(wc -l < "$CURL_LOG")" "0"
+# A read marker written after the poll wins over the one baked into the file.
+cp "$CACHE/seen.json" "$WORK/seen.bak"
+jq -c '.["'"$ACME"'/D0AAAAAA1"] = "1755900099.000000"' "$WORK/seen.bak" > "$CACHE/seen.json"
+cached="$(run counts-cached)"
+check "counts-cached splices in live read markers" "$(jq -r '.seen["'"$ACME"'/D0AAAAAA1"]' <<<"$cached")" "1755900099.000000"
+cp "$WORK/seen.bak" "$CACHE/seen.json"
+mv "$CACHE/counts.json" "$WORK/counts.bak"
+cached="$(run counts-cached)"
+check "counts-cached without a cache is not ok" "$(jq -r '.ok' <<<"$cached")" "false"
+check "counts-cached without a cache says so" "$(jq -r '.error' <<<"$cached")" "no cache"
+mv "$WORK/counts.bak" "$CACHE/counts.json"
 # A workspace whose token has gone away still gets a tile, tagged and errored.
 mv "$CFG/tokens/$BETA" "$WORK/beta.tok"
 out="$(run counts-all)"

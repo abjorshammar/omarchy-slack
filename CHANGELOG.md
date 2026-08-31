@@ -52,6 +52,25 @@
   downloads are batched the same way. A warm counts cycle drops from ~9s to
   ~2s; a cold open (empty caches) from ~15s to under 4s, with ~10× fewer
   processes spawned. Output is byte-for-byte unchanged.
+- **Unread counts now reach every conversation.** Slack has no bulk unread
+  endpoint for a user token, so each conversation costs one
+  `conversations.info` and only `MAX_CONV_INFO` fit in a cycle — and the same
+  first 30 won every time, which left the rest reading zero forever. With 70
+  DMs in a workspace, no channel was ever checked at all. The budget is now
+  spent in two tiers from remembered per-conversation state: everything
+  active within `HOT_SECONDS` (90 min) first, so a live conversation
+  refreshes every cycle, then the least recently checked, which rotates the
+  whole list through in a few cycles. An 84-conversation workspace reaches
+  full coverage in three.
+- A conversation not checked in a cycle now keeps the unread count and ts it
+  was last seen with, instead of reporting zero — otherwise the rotation
+  would blink unreads off and on as it passed. State lives in the
+  workspace's own cache dir and is dropped when it is signed out.
+- `MAX_CONV_INFO` and `HOT_SECONDS` can be set in the environment to retune
+  the budget; a non-numeric value falls back to the default.
+- The sidebar's "unreads checked for the 30 most relevant conversations" note
+  is gone: every conversation is checked now, just not all in one cycle.
+
 - The app window and the bar badge now paint immediately on open. `counts-all`
   keeps its last payload in `~/.cache/omarchy-slack/counts.json`, and the new
   `counts-cached` subcommand hands it back with no network call at all

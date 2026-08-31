@@ -28,11 +28,19 @@ TEAM_ID=""
 TEAM_CACHE=""
 USERS_CACHE=""    # v2: values are {n,i}, i is a local PNG path
 AVATAR_DIR=""
+CONV_STATE=""
 
 # Bounds. Slack method responses are small; the caps exist so a hostile or
 # misbehaving endpoint cannot stream without end into the shell process.
 MAX_BYTES=4194304          # 4 MiB per response
-MAX_CONV_INFO=30           # conversations.info calls per counts cycle
+# Both are overridable for a tighter or roomier rate budget, and are forced
+# back to their defaults if set to anything but a number — they are handed
+# straight to jq.
+MAX_CONV_INFO="${MAX_CONV_INFO:-30}"   # conversations.info calls per counts cycle
+HOT_SECONDS="${HOT_SECONDS:-5400}"     # activity this recent is polled every cycle
+[[ "$MAX_CONV_INFO" =~ ^[0-9]{1,4}$ ]] || MAX_CONV_INFO=30
+[[ "$HOT_SECONDS" =~ ^[0-9]{1,9}$ ]] || HOT_SECONDS=5400
+CONV_STATE_TTL=2592000     # 30d: forget a conversation not seen in that long
 MAX_USER_LOOKUPS=20        # users.info calls per cycle
 MAX_MSG_CHARS=4000         # chat.postMessage text cap (Slack's own limit)
 MAX_WORKSPACES=8           # workspaces polled by counts-all
@@ -76,6 +84,7 @@ set_team_paths() {
   TEAM_ID="$1"
   TEAM_CACHE="$CACHE_DIR/$TEAM_ID"
   USERS_CACHE="$TEAM_CACHE/users-v2.json"
+  CONV_STATE="$TEAM_CACHE/convstate.json"
   AVATAR_DIR="$TEAM_CACHE/avatars"
   mkdir -p "$TEAM_CACHE" 2>/dev/null || return 1
   chmod 700 "$TEAM_CACHE" 2>/dev/null || true
@@ -665,6 +674,22 @@ resolve_users() {
 # --------------------------------------------------------------------- counts
 
 # The shared read-marker map, keyed "<team>/<channel>".
+# Per-conversation polling state: {"<channel>": {latest, unread, checked}}.
+# Local bookkeeping only — it decides which conversations the next cycle
+# spends its conversations.info budget on, and supplies the last known unread
+# for the ones it skips. Lives in the workspace's own 0700 cache dir.
+load_conv_state() {
+  [[ -n "$CONV_STATE" && -s "$CONV_STATE" ]] || { echo '{}'; return 0; }
+  jq -c 'if type == "object" then . else {} end' "$CONV_STATE" 2>/dev/null || echo '{}'
+}
+
+save_conv_state() {
+  local content="$1"
+  [[ -n "$CONV_STATE" && -n "$content" ]] || return 0
+  jq -e 'type == "object"' <<<"$content" >/dev/null 2>&1 || return 0
+  write_atomic "$CONV_STATE" "$content" 2>/dev/null || true
+}
+
 load_seen() {
   if [[ -s "$SEEN_FILE" ]]; then
     jq -c 'if type == "object" then . else {} end' "$SEEN_FILE" 2>/dev/null || echo '{}'
@@ -760,23 +785,45 @@ counts_payload() {
       user: (.user // "")
     }]' <<<"$convs")"
 
-  # Unread counts: DMs first (their unreads are what the bar badge counts, so
-  # they must land inside the cap), rows with a valid channel id only. The
-  # first MAX_CONV_INFO are priced in one parallel conversations.info batch;
-  # the rest ride along marked uncounted. Same output as the old per-row loop,
-  # without one process per conversation.
-  local ordered enriched details to_fetch
-  ordered="$(jq -c '
-    [.[] | select(.id | test("^[CDGW][A-Z0-9]{5,30}$"))]
-    | [.[] | select(.kind == "im" or .kind == "mpim")]
-      + [.[] | select(.kind != "im" and .kind != "mpim")]' <<<"$base")"
+  # Unread counts. Slack has no bulk unread endpoint for a user token, so each
+  # conversation costs one conversations.info and only MAX_CONV_INFO of them
+  # fit in a cycle's rate budget. Which ones is the interesting part: picking
+  # the same first 30 every time left the rest permanently reading zero (with
+  # 70 DMs, no channel was ever checked at all).
+  #
+  # So the budget is spent in two tiers, from remembered per-conversation
+  # state: everything active within HOT_SECONDS first, so a live conversation
+  # refreshes every cycle, then the remainder fills with the least recently
+  # checked, which rotates the whole list through over a few cycles. Anything
+  # not checked this cycle keeps the unread and ts it was last seen with
+  # rather than reporting zero, or a conversation would blink unread off and
+  # on as the rotation passed it.
+  #
+  # ponytail: a message in a conversation dormant for longer than HOT_SECONDS
+  # waits for the sweep to reach it (a few cycles). Only a push channel would
+  # fix that, and Slack offers none to a user token.
+  local ordered enriched details to_fetch state now
+  now="$(date +%s)"
+  state="$(load_conv_state)"
+  ordered="$(jq -c --argjson st "$state" --argjson now "$now" --argjson hot "$HOT_SECONDS" '
+    [ .[]
+      | select(.id | test("^[CDGW][A-Z0-9]{5,30}$"))
+      | . + {_s: ($st[.id] // {})} ]
+    | sort_by([ (if (((._s.latest // "") | tonumber? // 0) > ($now - $hot)) then 0 else 1 end),
+                (._s.checked // 0) ])' <<<"$base")"
   to_fetch="$(jq -c --argjson cap "$MAX_CONV_INFO" '[.[range(0; ([length, $cap] | min))].id]' <<<"$ordered")"
   details="$(batch_conversations_info "$to_fetch")"
-  enriched="$(jq -c --argjson d "$details" --argjson cap "$MAX_CONV_INFO" '
-    [ range(0; length) as $i | .[$i] as $row
-      | if $i < $cap
-        then $row + ($d[$row.id] // {unread: 0, latest: ""})
-        else $row + {unread: 0, latest: "", uncounted: true} end ]' <<<"$ordered")"
+  # A row missing from the batch was either not selected or its request
+  # failed; both fall back to what we remember, never to a bare zero.
+  enriched="$(jq -c --argjson d "$details" '
+    [ .[]
+      | if $d[.id] then . + $d[.id]
+        else . + {unread: (._s.unread // 0), latest: (._s.latest // ""), uncounted: true} end
+      | del(._s) ]' <<<"$ordered")"
+  save_conv_state "$(jq -c --argjson st "$state" --argjson now "$now" --argjson ttl "$CONV_STATE_TTL" '
+    reduce (to_entries[]) as $e ($st;
+      .[$e.key] = {latest: ($e.value.latest // ""), unread: ($e.value.unread // 0), checked: $now})
+    | with_entries(select((.value.checked // 0) > ($now - $ttl)))' <<<"$details")"
 
   # Resolve DM counterpart names through this workspace's user cache.
   local dm_ids users
@@ -800,7 +847,7 @@ counts_payload() {
     '{ok:true, team:$me.team, team_id:(if $me.team_id != "" then $me.team_id else $team_id end),
       self:$me.user, self_id:$me.user_id, url:$me.url,
       presence:$presence.presence, snoozing:$dnd.snoozing, snooze_until:$dnd.snooze_until,
-      capped: ([$rows[] | select(.uncounted == true)] | length > 0),
+      capped: ([$rows[] | select(.uncounted == true)] | length > 0),  # some rows carry remembered counts, not fresh ones
       conversations: [$rows[] | {
         id, kind, latest,
         key: ($team_id + "/" + .id),

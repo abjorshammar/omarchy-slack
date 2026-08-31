@@ -80,6 +80,18 @@ BarWidget {
     Component.onCompleted: running = true
   }
 
+  // First paint: the last poll's payload off disk, so a freshly started bar
+  // shows the badge it had rather than nothing until its own fetch returns.
+  Process {
+    id: cachedCountsProc
+    command: Model.countsCachedCommand(root.scriptDir)
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (!root.counts) root.applyCounts(text)
+    }
+    Component.onCompleted: running = true
+  }
+
   Process {
     id: countsProc
     command: Model.countsAllCommand(root.scriptDir, true)

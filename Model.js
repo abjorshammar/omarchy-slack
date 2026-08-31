@@ -36,6 +36,11 @@ function countsAllCommand(scriptDir, showChannels) {
   return ["bash", script(scriptDir), "counts-all", convTypes(showChannels)]
 }
 
+// The last poll's payload off disk, no network — what the UI paints first.
+function countsCachedCommand(scriptDir) {
+  return ["bash", script(scriptDir), "counts-cached"]
+}
+
 function workspacesCommand(scriptDir) {
   return ["bash", script(scriptDir), "workspaces"]
 }
@@ -520,6 +525,7 @@ if (typeof module !== "undefined") {
   module.exports = {
     countsCommand: countsCommand,
     countsAllCommand: countsAllCommand,
+    countsCachedCommand: countsCachedCommand,
     workspacesCommand: workspacesCommand,
     useCommand: useCommand,
     historyCommand: historyCommand,

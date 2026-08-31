@@ -62,6 +62,9 @@ never `shell.json`.
 
 - `~/.config/omarchy-slack/token` — 0600 fallback token (keyring preferred)
 - `~/.config/omarchy-slack/oauth.json` — optional own-app OAuth override
+  (`client_id`, `proxy_url`, optional `port`, and optional
+  `sync_read_state: true` to add the four `*:write` scopes to the browser
+  flow's consent screen)
 - `~/.cache/omarchy-slack/` — users.json (display names), hist-*.json
   (60 s history cache), seen.json (read markers)
 

@@ -18,8 +18,13 @@ mention badge keeps watch in your bar. No Electron, no half-gigabyte client.
   page; the token comes back to the plugin and goes straight into your
   system keyring. No copy-pasting API keys.
 - **A badge that means something.** The bar icon counts unread DMs and group
-  DMs in red — every one of those is aimed at you. Channel unreads light the
-  icon and dot the sidebar.
+  DMs in red — every one of those is aimed at you, across every workspace
+  you're signed in to. Channel unreads light the icon and dot the sidebar.
+- **Every workspace, one app.** Sign in to as many Slack workspaces as you
+  like and switch between them from a rail of tiles down the left, each with
+  its own unread badge — `Ctrl+1…9` jumps straight to one. The rail only
+  appears once you have more than one workspace, so nothing changes if you
+  don't need it.
 - **Presence & Do Not Disturb.** Toggle active/away and snooze notifications
   for an hour from the sidebar.
 - **Made for Omarchy.** Every color comes from your active theme, light
@@ -48,6 +53,10 @@ o.bind("SUPER + SHIFT + S", "Slack", "omarchy-shell shell toggle bottelet.slack"
 
 Then click the Slack icon and press **Sign in with Slack**. Your browser
 opens Slack's consent page; approve it and you're in.
+
+To add a second workspace, open ⚙ in the app and press **Add another
+workspace** — the same sign-in, and the token itself tells the plugin which
+workspace it belongs to. Once you have two, the workspace rail appears.
 
 The app opens as a normal window. Hyprland tiles new windows by default; to
 have it float like a typical app, add to your Hyprland config:
@@ -102,26 +111,36 @@ should not ask for write access nobody wanted. To turn it on, add
 
 Your Slack app must also declare those four scopes under **OAuth &
 Permissions → User Token Scopes**, or Slack rejects the authorize request with
-`invalid_scope`. Scopes are fixed at authorization, so a token issued earlier
-keeps the scopes it was granted — sign out and back in to pick up the new
-ones. `slack.sh login-available` prints the exact scope list it will request.
+`invalid_scope`. Scopes are fixed at authorization, so a workspace you signed
+in to earlier keeps the scopes it was granted — sign out of it and back in to
+pick up the new ones. `slack.sh login-available` prints the exact scope list
+that will be requested.
+
+Mixing the two paths across workspaces is where this bites: a workspace added
+by browser sign-in without the opt-in will silently *not* sync read state,
+while a pasted-token workspace in the same app will.
 
 ## Rate limits, honestly
 
 Slack gives personal (non-Marketplace) apps created after May 2025 one
-`conversations.history` request per minute, 15 messages at a time. The plugin
-is built around that budget: opening a conversation fetches live, refreshes
-are cached for a minute, your own replies are appended locally instead of
-refetched, and the open conversation re-polls once a minute. Unread counts
-use different (roomier) API methods and poll every 3 minutes by default
-(`omarchy bar set bottelet.slack refreshMinutes N`).
+`conversations.history` request per minute, 15 messages at a time. These
+budgets are per app *per workspace*, so signing in to several does not make
+any one of them tighter. The plugin is built around that budget: opening a
+conversation fetches live, refreshes are cached for a minute, your own
+replies are appended locally instead of refetched, and the open conversation
+re-polls once a minute. Unread counts use different (roomier) API methods and
+poll every 3 minutes by default (`omarchy bar set bottelet.slack
+refreshMinutes N`), fetching all your workspaces in parallel.
 
 ## Privacy & security
 
 - Your Slack password is only ever typed on Slack's own pages.
-- The token lives in your system keyring (`secret-tool`), or in
-  `~/.config/omarchy-slack/token` with `0600` permissions when no keyring is
-  available — never in `shell.json`, never in the repo.
+- Each workspace's token lives in your system keyring (`secret-tool`, under
+  `service omarchy-slack key ws-token team <workspace-id>`), or in
+  `~/.config/omarchy-slack/tokens/<workspace-id>` with
+  `0600` permissions when no keyring is available — never in `shell.json`,
+  never in the repo. `~/.config/omarchy-slack/workspaces.json` records only
+  which workspaces exist and which is active; it never holds a token.
 - The token and the OAuth client secret are passed to `curl` via stdin or
   in-memory header files — they never appear on a command line or in
   `/proc`.
@@ -141,13 +160,18 @@ use different (roomier) API methods and poll every 3 minutes by default
   repo; the proxy is stateless and logs nothing. Your token reaches your
   machine over loopback and goes straight into the keyring.
 - Message caches and read markers live in `~/.cache/omarchy-slack` with
-  `0700`/`0600` permissions — private to your user, like the token.
+  `0700`/`0600` permissions — private to your user, like the token. Each
+  workspace gets its own subdirectory: Slack user ids are only unique within
+  a workspace, so a shared cache would put the wrong name and face on a DM.
+  Workspace ids are validated against `^[TE][A-Z0-9]+$` before they are ever
+  used as a path.
 - Like every native app with browser sign-in (GitHub CLI included), the
   shipped OAuth client credentials are public. They can't read anyone's
   Slack: a token is only ever issued to the person who completes the consent
   screen, and it goes only to their local keyring.
-- **Sign out & forget token** (⚙ in the app) removes the token and the local
-  message cache (`~/.cache/omarchy-slack`).
+- **Sign out** (⚙ in the app) removes that workspace's token, its cache and
+  its read markers, leaving your other workspaces alone; **Sign out of all
+  workspaces** removes everything.
 
 ## Remove
 
@@ -155,13 +179,23 @@ use different (roomier) API methods and poll every 3 minutes by default
 omarchy plugin remove bottelet.slack
 ```
 
-Removing the plugin keeps your token and cache. To wipe those too, use
-**Sign out & forget token** first, or run:
+Removing the plugin keeps your tokens and caches. To wipe those too, use
+**Sign out of all workspaces** first, or run:
 
 ```sh
-secret-tool clear service omarchy-slack key token
+bash ~/.config/omarchy/plugins/bottelet.slack/scripts/slack.sh clear-token --all
+```
+
+which clears every workspace's keyring entry and cache, or by hand:
+
+```sh
+secret-tool clear service omarchy-slack key ws-token   # every workspace
+secret-tool clear service omarchy-slack key token      # pre-1.1 installs
 rm -rf ~/.config/omarchy-slack ~/.cache/omarchy-slack
 ```
+
+(`secret-tool` matches on a subset of attributes, so the first command
+removes every workspace's token at once.)
 
 To revoke server-side, remove "Omarchy Slack" under your Slack workspace's
 **Apps** page.
@@ -170,7 +204,10 @@ To revoke server-side, remove "Omarchy Slack" under your Slack workspace's
 
 `tests/run.sh` — an offline suite (stub `curl`, no token needed) covering
 command routing, input validation, history caching, rate-limit fallbacks,
-the OAuth listener, and that secrets never touch a process command line.
+per-workspace isolation, migration from a single-workspace install, the
+OAuth listener, and that secrets never touch a process command line. Where
+`node` is present it also runs the argv `Model.js` builds against the real
+script, so the QML-to-shell contract is checked too.
 
 ---
 

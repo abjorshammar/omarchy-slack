@@ -17,7 +17,8 @@ unlisted apps), it takes about two minutes:
          "user": [
            "channels:read", "groups:read", "im:read", "mpim:read",
            "channels:history", "groups:history", "im:history", "mpim:history",
-           "chat:write", "users:read", "dnd:read", "dnd:write", "users:write"
+           "chat:write", "users:read", "dnd:read", "dnd:write", "users:write",
+           "files:read"
          ]
        }
      }

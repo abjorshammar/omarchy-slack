@@ -297,6 +297,47 @@ function userAvatar(users, id) {
   return validAvatar(u.i) ? u.i : ""
 }
 
+// A message attachment the script managed to cache locally: a jpeg or png
+// under that workspace's own files dir, named for its Slack file id. Nothing
+// remote is ever accepted here — files.slack.com needs an auth header Image
+// cannot send, so a path is the only thing that can actually render.
+function validFilePath(x) {
+  return /\/omarchy-slack\/[TE][A-Z0-9]+\/files\/F[A-Z0-9]+\.(jpg|png)$/.test(String(x || ""))
+}
+
+function fileSource(x) {
+  return validFilePath(x) ? "file://" + String(x) : ""
+}
+
+// "204 KB" / "1.4 MB" — what the row shows when there is no local image.
+function fileSize(bytes) {
+  var n = parseInt(bytes, 10) || 0
+  if (n <= 0) return ""
+  if (n < 1024) return n + " B"
+  if (n < 1048576) return Math.round(n / 1024) + " KB"
+  return (n / 1048576).toFixed(1) + " MB"
+}
+
+// The attachments of one message, already narrowed to what the UI can use.
+function messageFiles(m) {
+  var out = []
+  var src = (m && m.files) || []
+  for (var i = 0; i < src.length; i++) {
+    var f = src[i] || {}
+    out.push({
+      id: String(f.id || ""),
+      name: String(f.name || "file"),
+      size: fileSize(f.size),
+      path: fileSource(f.path),
+      // Slack gives the thumbnail's own dimensions; they keep the image from
+      // jumping as it loads and cap how tall one attachment can get.
+      w: parseInt(f.w, 10) || 0,
+      h: parseInt(f.h, 10) || 0
+    })
+  }
+  return out
+}
+
 // Avatars are either a local PNG the script converted (Slack serves webp,
 // which Qt can't decode) under that workspace's own cache dir, or — as a
 // fallback — a URL on Slack's own image hosts. Nothing else is accepted.
@@ -448,6 +489,7 @@ function buildMessages(payload, selfId, boundaryTs) {
       threadTs: String(m.thread_ts || ""),
       time: msgTime(m.ts),
       url: firstUrl(text),
+      files: messageFiles(m),
       text: text,
       rich: mrkdwnToStyled(m.text, users)
     })
@@ -559,6 +601,10 @@ if (typeof module !== "undefined") {
     mrkdwnToStyled: mrkdwnToStyled,
     emojify: emojify,
     validAvatar: validAvatar,
+    validFilePath: validFilePath,
+    fileSource: fileSource,
+    fileSize: fileSize,
+    messageFiles: messageFiles,
     avatarSource: avatarSource,
     userName: userName,
     userAvatar: userAvatar,

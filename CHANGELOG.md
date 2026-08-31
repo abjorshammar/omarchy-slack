@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Fixed: a conversation whose newest message is a *threaded* reply could never
+  be marked read. `conversations.history` returns only top-level messages, so
+  the read marker stopped short of the conversation head and the unread badge
+  stayed lit forever — and `conversations.mark` was called with a ts behind
+  Slack's own `last_read`, making it a no-op even with the optional write
+  scopes. Slack assistant/app DMs hit this on every reply.
+
 ## 1.0.0
 
 Initial release.

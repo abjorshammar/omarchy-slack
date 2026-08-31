@@ -361,6 +361,24 @@ function buildMessages(payload, selfId, boundaryTs) {
   return out
 }
 
+// The ts to record as read once a conversation has been opened.
+//
+// A conversation's head (conversations.info `latest`) can be NEWER than
+// anything conversations.history returns: history yields only top-level
+// messages, so a threaded reply never appears — and in a Slack assistant/app
+// DM every message is one. Marking read at the last fetched ts then never
+// reaches the head, so applyLocalRead never clears the conversation and the
+// unread badge stays lit forever; conversations.mark also receives a ts behind
+// Slack's own last_read, making it a no-op even where the optional write
+// scopes were granted. Opening a conversation means the user has seen
+// everything this app can show, so the head wins when it is newer.
+function readMarkerTs(payload, convoLatest) {
+  var ts = lastTs(payload)
+  var head = String(convoLatest || "")
+  if (head !== "" && (ts === "" || parseFloat(head) > parseFloat(ts))) return head
+  return ts
+}
+
 function lastTs(payload) {
   var msgs = (payload && payload.messages) || []
   return msgs.length ? String(msgs[msgs.length - 1].ts || "") : ""
@@ -441,6 +459,7 @@ if (typeof module !== "undefined") {
     firstUrl: firstUrl,
     buildMessages: buildMessages,
     lastTs: lastTs,
+    readMarkerTs: readMarkerTs,
     msgTime: msgTime,
     dayLabelFor: dayLabelFor,
     snoozeLabel: snoozeLabel

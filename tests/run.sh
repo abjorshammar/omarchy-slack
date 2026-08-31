@@ -32,104 +32,125 @@ export CURL_BODY_LOG="$WORK/curl-body.log"
 cat > "$STUB_BIN/curl" <<'STUB'
 #!/bin/bash
 printf '%s\n' "ARGV: $*" >> "$CURL_LOG"
-url=""
-body=""
-outfile=""
-avurl=""
-hdr=""
-prev=""
+
+# Which test workspace a token belongs to.
+team_of() { case "$1" in *beta*|*BETA*) echo beta ;; *) echo acme ;; esac; }
+
+# respond <method> <channel> <user> <types> <team> — the canned JSON for one
+# request, on stdout. Shared by the single-call path and the -K batch path.
+respond() {
+  local method="$1" ch="$2" user="$3" types="$4" team="$5"
+  case "$method" in
+    auth.test)
+      if [[ "$team" == beta ]]; then
+        echo '{"ok":true,"url":"https://beta.slack.com/","team":"Beta Inc","user":"casper.b","team_id":"T0BETA002","user_id":"U9999999"}'
+      else
+        echo '{"ok":true,"url":"https://acme.slack.com/","team":"Acme","user":"casper","team_id":"T0ACME001","user_id":"U1111111"}'
+      fi ;;
+    users.conversations)
+      if [[ "$team" == beta ]]; then
+        echo '{"ok":true,"channels":[{"id":"D0BETADM1","is_im":true,"user":"U2222222"}]}'
+      elif [[ "$types" == *public_channel* ]]; then
+        echo '{"ok":true,"channels":[
+          {"id":"D0AAAAAA1","is_im":true,"user":"U2222222"},
+          {"id":"C0BBBBBB2","name":"general","is_channel":true},
+          {"id":"G0CCCCCC3","name":"mpdm-a--b-1","is_mpim":true,"is_private":true}]}'
+      else
+        echo '{"ok":true,"channels":[
+          {"id":"D0AAAAAA1","is_im":true,"user":"U2222222"},
+          {"id":"G0CCCCCC3","name":"mpdm-a--b-1","is_mpim":true,"is_private":true}]}'
+      fi ;;
+    conversations.info)
+      if [[ "$ch" == D0AAAAAA1 ]]; then
+        echo '{"ok":true,"channel":{"id":"D0AAAAAA1","unread_count_display":3,"latest":{"ts":"1755900000.000100"}}}'
+      elif [[ "$ch" == D0BETADM1 ]]; then
+        echo '{"ok":true,"channel":{"id":"D0BETADM1","unread_count_display":5,"latest":{"ts":"1755900000.000900"}}}'
+      else
+        echo '{"ok":true,"channel":{"id":"'"$ch"'","unread_count_display":1,"latest":{"ts":"1755900001.000100"}}}'
+      fi ;;
+    users.info)
+      # Same user id, a different person in each workspace — exactly what a
+      # shared user cache would get wrong.
+      if [[ "$team" == beta ]]; then
+        echo '{"ok":true,"user":{"id":"U2222222","name":"bob","real_name":"Bob Beta","profile":{"display_name":"bob.b","image_72":"https://ca.slack-edge.com/T2-U2-72.png"}}}'
+      else
+        echo '{"ok":true,"user":{"id":"U2222222","name":"jane","real_name":"Jane Doe","profile":{"display_name":"jane.d","image_72":"https://ca.slack-edge.com/T1-U2-72.png","image_48":"http://insecure.example/x.png"}}}'
+      fi ;;
+    users.getPresence) echo '{"ok":true,"presence":"active"}' ;;
+    dnd.info)          echo '{"ok":true,"snooze_enabled":false}' ;;
+    conversations.history)
+      if [[ -n "${FAKE_RATELIMIT:-}" ]]; then echo '{"ok":false,"error":"ratelimited"}'; return 0; fi
+      echo '{"ok":true,"messages":[
+        {"type":"message","ts":"1755900002.000200","user":"U2222222","text":"newest <b>bold</b> &amp; stuff","reply_count":2,"thread_ts":"1755900002.000200"},
+        {"type":"message","ts":"1755900001.000100","user":"U1111111","text":"older message"}]}' ;;
+    conversations.replies)
+      echo '{"ok":true,"messages":[
+        {"type":"message","ts":"1755900002.000200","user":"U2222222","text":"parent","reply_count":2,"thread_ts":"1755900002.000200"},
+        {"type":"message","ts":"1755900002.000300","user":"U1111111","text":"first reply :tada:","thread_ts":"1755900002.000200"},
+        {"type":"message","ts":"1755900002.000400","user":"U2222222","text":"second reply","thread_ts":"1755900002.000200"}]}' ;;
+    chat.postMessage)  echo '{"ok":true,"channel":"D0AAAAAA1","ts":"1755900003.000300"}' ;;
+    conversations.mark) echo '{"ok":true}' ;;
+    users.setPresence|dnd.setSnooze|dnd.endSnooze) echo '{"ok":true,"snooze_endtime":1755903600}' ;;
+    *) echo '{"ok":false,"error":"stub_unknown_method:'"$method"'"}' ;;
+  esac
+}
+
+# url -> (method, channel, user, types) and dispatch to respond / avatar.
+handle_url() {
+  local u="$1" out="$2" team="$3"
+  case "$u" in
+    https://*.slack-edge.com/*|https://secure.gravatar.com/*)
+      # Avatar: emit a real, valid image so cache_avatar's magick convert works.
+      if [[ -n "$out" ]]; then magick -size 8x8 xc:'#3366cc' "png:$out" 2>/dev/null || printf 'x' > "$out"; fi
+      return 0 ;;
+  esac
+  local method ch="" user="" types=""
+  method="${u##*/api/}"; method="${method%%\?*}"
+  case "$u" in *channel=*) ch="${u##*channel=}"; ch="${ch%%&*}" ;; esac
+  case "$u" in *user=*)    user="${u##*user=}";  user="${user%%&*}" ;; esac
+  case "$u" in *types=*)   types="${u##*types=}"; types="${types%%&*}" ;; esac
+  if [[ -n "$out" ]]; then respond "$method" "$ch" "$user" "$types" "$team" > "$out"
+  else respond "$method" "$ch" "$user" "$types" "$team"; fi
+}
+
+# ---- -K - : a curl config on stdin (the batched path) ----
+kmode=0; prev=""
+for a in "$@"; do [[ "$prev" == "-K" && "$a" == "-" ]] && kmode=1; prev="$a"; done
+if (( kmode )); then
+  token=""; url=""
+  while IFS= read -r line; do
+    case "$line" in
+      *"Authorization: Bearer "*) token="${line##*Bearer }"; token="${token%\"*}" ;;
+      "url = "*)    url="${line#url = }";    url="${url#\"}";    url="${url%\"}" ;;
+      "output = "*) out="${line#output = }"; out="${out#\"}";    out="${out%\"}"
+                    [[ -n "$url" ]] && handle_url "$url" "$out" "$(team_of "$token")"; url="" ;;
+    esac
+  done
+  exit 0
+fi
+
+# ---- single request (token via -H @file, never argv) ----
+url=""; body=""; outfile=""; avurl=""; hdr=""; prev=""
 for a in "$@"; do
   case "$a" in https://slack.com/api/*) url="$a" ;; esac
   case "$a" in https://*.slack-edge.com/*|https://secure.gravatar.com/*) avurl="$a" ;; esac
-  if [[ "$prev" == "-o" ]]; then outfile="$a"; fi
-  if [[ "$prev" == "--data-binary" || "$prev" == "-d" ]]; then body="$a"; fi
-  # The bearer token arrives as an @file header (never argv). Reading it here
-  # is how the stub tells the two test workspaces apart.
-  if [[ "$prev" == "-H" && "$a" == @* ]]; then
-    f="${a#@}"
-    [[ -r "$f" ]] && hdr="$hdr$(cat "$f" 2>/dev/null)"
-  fi
+  [[ "$prev" == "-o" ]] && outfile="$a"
+  [[ "$prev" == "--data-binary" || "$prev" == "-d" ]] && body="$a"
+  if [[ "$prev" == "-H" && "$a" == @* ]]; then f="${a#@}"; [[ -r "$f" ]] && hdr="$hdr$(cat "$f" 2>/dev/null)"; fi
   prev="$a"
 done
-tok="${hdr##*Bearer }"
-tok="${tok%%$'\n'*}"
-team="acme"
-case "$tok" in *beta*|*BETA*) team="beta" ;; esac
-
-# Avatar download: emit a real, valid image so cache_avatar's magick convert
-# works (magick generates it to guarantee valid PNG data).
 if [[ -n "$avurl" && -n "$outfile" ]]; then
-  magick -size 8x8 xc:'#3366cc' "png:$outfile" 2>/dev/null || printf 'x' > "$outfile"
-  exit 0
+  magick -size 8x8 xc:'#3366cc' "png:$outfile" 2>/dev/null || printf 'x' > "$outfile"; exit 0
 fi
-if [[ "$body" == "@-" ]]; then body="$(cat)"; fi
+[[ "$body" == "@-" ]] && body="$(cat)"
 [[ -n "$body" ]] && printf '%s\n' "BODY: $body" >> "$CURL_BODY_LOG"
-method="${url##*/api/}"
-method="${method%%\?*}"
-case "$method" in
-  auth.test)
-    if [[ "$team" == beta ]]; then
-      echo '{"ok":true,"url":"https://beta.slack.com/","team":"Beta Inc","user":"casper.b","team_id":"T0BETA002","user_id":"U9999999"}'
-    else
-      echo '{"ok":true,"url":"https://acme.slack.com/","team":"Acme","user":"casper","team_id":"T0ACME001","user_id":"U1111111"}'
-    fi ;;
-  users.conversations)
-    # Honour the requested types, so a DM-only request really is DM-only.
-    types=""
-    for a in "$@"; do case "$a" in types=*) types="${a#types=}" ;; esac; done
-    if [[ "$team" == beta ]]; then
-      echo '{"ok":true,"channels":[{"id":"D0BETADM1","is_im":true,"user":"U2222222"}]}'
-    elif [[ "$types" == *public_channel* ]]; then
-      echo '{"ok":true,"channels":[
-        {"id":"D0AAAAAA1","is_im":true,"user":"U2222222"},
-        {"id":"C0BBBBBB2","name":"general","is_channel":true},
-        {"id":"G0CCCCCC3","name":"mpdm-a--b-1","is_mpim":true,"is_private":true}]}'
-    else
-      echo '{"ok":true,"channels":[
-        {"id":"D0AAAAAA1","is_im":true,"user":"U2222222"},
-        {"id":"G0CCCCCC3","name":"mpdm-a--b-1","is_mpim":true,"is_private":true}]}'
-    fi ;;
-  conversations.info)
-    ch=""
-    for a in "$@"; do case "$a" in channel=*) ch="${a#channel=}" ;; esac; done
-    if [[ "$ch" == D0AAAAAA1 ]]; then
-      echo '{"ok":true,"channel":{"id":"D0AAAAAA1","unread_count_display":3,"latest":{"ts":"1755900000.000100"}}}'
-    elif [[ "$ch" == D0BETADM1 ]]; then
-      echo '{"ok":true,"channel":{"id":"D0BETADM1","unread_count_display":5,"latest":{"ts":"1755900000.000900"}}}'
-    else
-      echo '{"ok":true,"channel":{"id":"'"$ch"'","unread_count_display":1,"latest":{"ts":"1755900001.000100"}}}'
-    fi ;;
-  users.info)
-    # Same user id, a different person in each workspace — exactly what a
-    # shared user cache would get wrong.
-    if [[ "$team" == beta ]]; then
-      echo '{"ok":true,"user":{"id":"U2222222","name":"bob","real_name":"Bob Beta","profile":{"display_name":"bob.b","image_72":"https://ca.slack-edge.com/T2-U2-72.png"}}}'
-    else
-      echo '{"ok":true,"user":{"id":"U2222222","name":"jane","real_name":"Jane Doe","profile":{"display_name":"jane.d","image_72":"https://ca.slack-edge.com/T1-U2-72.png","image_48":"http://insecure.example/x.png"}}}'
-    fi ;;
-  users.getPresence)
-    echo '{"ok":true,"presence":"active"}' ;;
-  dnd.info)
-    echo '{"ok":true,"snooze_enabled":false}' ;;
-  conversations.history)
-    if [[ -n "${FAKE_RATELIMIT:-}" ]]; then echo '{"ok":false,"error":"ratelimited"}'; exit 0; fi
-    echo '{"ok":true,"messages":[
-      {"type":"message","ts":"1755900002.000200","user":"U2222222","text":"newest <b>bold</b> &amp; stuff","reply_count":2,"thread_ts":"1755900002.000200"},
-      {"type":"message","ts":"1755900001.000100","user":"U1111111","text":"older message"}]}' ;;
-  conversations.replies)
-    echo '{"ok":true,"messages":[
-      {"type":"message","ts":"1755900002.000200","user":"U2222222","text":"parent","reply_count":2,"thread_ts":"1755900002.000200"},
-      {"type":"message","ts":"1755900002.000300","user":"U1111111","text":"first reply :tada:","thread_ts":"1755900002.000200"},
-      {"type":"message","ts":"1755900002.000400","user":"U2222222","text":"second reply","thread_ts":"1755900002.000200"}]}' ;;
-  chat.postMessage)
-    echo '{"ok":true,"channel":"D0AAAAAA1","ts":"1755900003.000300"}' ;;
-  conversations.mark)
-    echo '{"ok":true}' ;;
-  users.setPresence|dnd.setSnooze|dnd.endSnooze)
-    echo '{"ok":true,"snooze_endtime":1755903600}' ;;
-  *)
-    echo '{"ok":false,"error":"stub_unknown_method:'"$method"'"}' ;;
-esac
+tok="${hdr##*Bearer }"; tok="${tok%%$'\n'*}"
+method="${url##*/api/}"; method="${method%%\?*}"
+ch=""; user=""; types=""
+for a in "$@"; do
+  case "$a" in channel=*) ch="${a#channel=}" ;; user=*) user="${a#user=}" ;; types=*) types="${a#types=}" ;; esac
+done
+respond "$method" "$ch" "$user" "$types" "$(team_of "$tok")"
 STUB
 chmod +x "$STUB_BIN/curl"
 

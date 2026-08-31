@@ -175,6 +175,21 @@ Item {
     scrollToBottom()
   }
 
+  // Esc from a conversation returns to the sidebar without closing the app.
+  // Escape's handler has always called this; it was never defined, so the
+  // call threw a TypeError and Esc did nothing instead of going back.
+  function backToList() {
+    convo = null
+    messages = []
+    threadTs = ""
+    threadMessages = []
+    selectedMsg = -1
+    historyError = ""
+    historyNote = ""
+    sendError = ""
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
   function scrollToBottom() {
     Qt.callLater(function() { messageList.positionViewAtEnd() })
   }

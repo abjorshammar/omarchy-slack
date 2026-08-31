@@ -283,6 +283,37 @@ check "status after clear" "$(jq -r '.has_token' <<<"$out")" "false"
 out="$(run counts)"
 check "counts without token errors" "$(jq -r '.error' <<<"$out")" "no token"
 
+# A conversation whose newest activity is a threaded reply: conversations.history
+# cannot return it, so reading must still advance the read marker to the
+# conversation head, or its unread badge can never be cleared.
+echo "== read marker vs conversation head"
+if ! command -v node >/dev/null 2>&1; then
+  echo "  (skipped: node not installed)"
+else
+  marker() { node -e '
+    var M = require(process.argv[1]);
+    process.stdout.write(M.readMarkerTs(JSON.parse(process.argv[2]), process.argv[3]));
+  ' "$HERE/../Model.js" "$@"; }
+  HIST='{"messages":[{"ts":"1785512100.000100"},{"ts":"1785512157.362129"}]}'
+  check "head newer than history wins" "$(marker "$HIST" "1785512651.787609")" "1785512651.787609"
+  check "history wins when it is newer" "$(marker "$HIST" "1785512120.000000")" "1785512157.362129"
+  check "no head falls back to history"  "$(marker "$HIST" "")" "1785512157.362129"
+  check "empty history still uses the head" "$(marker '{"messages":[]}' "1785512651.787609")" "1785512651.787609"
+  check "neither gives no marker" "$(marker '{"messages":[]}' "")" ""
+  # The regression itself: with the head ignored, the marker stops short of
+  # `latest` and applyLocalRead can never clear the conversation.
+  head="1785512651.787609"
+  mark="$(marker "$HIST" "$head")"
+  cleared="$(node -e '
+    var M = require(process.argv[1]);
+    var rows = M.applyLocalRead(
+      [{id:"D0BAY8ATQ1Y", kind:"im", unread:1, latest:process.argv[2]}],
+      {"D0BAY8ATQ1Y": process.argv[3]});
+    process.stdout.write(String(rows[0].effectiveUnread));
+  ' "$HERE/../Model.js" "$head" "$mark")"
+  check "the unread actually clears" "$cleared" "0"
+fi
+
 echo "== secrets hygiene"
 if grep -q 'xoxp-1234567890' "$CURL_LOG"; then
   fail "token appeared on a curl argv"

@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **Multiple workspaces.** Sign in to more than one Slack workspace and
+  switch between them, the way the native apps do. A rail of workspace tiles
+  appears down the left of the app — but only once there are two or more, so
+  a single-workspace install looks exactly as it did. `Ctrl+1…9` switches;
+  each tile carries its own unread badge; switching remembers the
+  conversation you left open in each workspace.
+- The bar badge now counts unread DMs across **every** signed-in workspace,
+  so a DM in a workspace you are not looking at still reaches you. Hovering
+  breaks the count down per workspace.
+- Tokens, message caches, user names and avatars are namespaced per
+  workspace (Slack user ids are only unique within a workspace, so a shared
+  cache would show the wrong name and face on a DM). Read markers stay in one
+  shared file, keyed `<team>/<channel>`.
+- Existing single-workspace installs migrate themselves on first run — the
+  token, caches and read markers move under the workspace they belong to. No
+  re-authentication, no extra API call. Avatar paths stored inside the user
+  cache are rewritten too, since they are absolute and `resolve_users` never
+  refetches a user it already knows.
+- Per-workspace tokens use the keyring key `ws-token`, not the legacy `token`
+  plus a `team` attribute: `secret-tool` matches on an attribute *subset*, so
+  anything clearing the legacy key would also have deleted every
+  per-workspace token — including, during migration, the one just written.
+- Add a workspace from ⚙ → **Add another workspace**, or the `+` tile on the
+  rail. Sign out of one workspace, or all of them, from the same page.
+- `scripts/slack.sh` takes an optional leading `--team <id>` on every command
+  and defaults to the active workspace; new `counts-all`, `workspaces` and
+  `use` subcommands.
 - Browser sign-in can request the read-state-sync write scopes by opting in
   with `"sync_read_state": true` in `oauth.json`; `login-available` reports the
   exact scope list it will ask for.

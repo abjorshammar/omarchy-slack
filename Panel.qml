@@ -24,6 +24,7 @@ Item {
   property string fontFamily: Style.font.menuFamily
   property int contentMargin: Style.spacing.panelPadding
   property int sidebarWidth: Style.space(250)
+  property int railWidth: Style.space(44)
 
   readonly property string scriptDir: Qt.resolvedUrl("scripts/").toString().replace("file://", "")
 
@@ -39,6 +40,22 @@ Item {
   property var counts: null
   property string countsError: ""
   property var seenMap: ({})
+
+  // ---- workspaces ----
+  // counts-all covers every signed-in workspace in one payload; `counts` is
+  // whichever of them is currently active. The rail, and every other bit of
+  // switching chrome, only exists once there is more than one — with a single
+  // workspace the app looks exactly as it did before.
+  property var countsAllData: null
+  property var workspaces: []
+  property string activeTeam: ""
+  property int workspaceCount: 0
+  readonly property bool multiWorkspace: workspaces.length > 1 || workspaceCount > 1
+  // teamId → the conversation left open there, so switching back lands where
+  // you were, the way the native apps do.
+  property var lastConvo: ({})
+  // Adding a workspace reuses the sign-in view while staying signed in.
+  property bool addingWorkspace: false
 
   property bool loginAvailable: false
   property bool loginBusy: false
@@ -119,8 +136,13 @@ Item {
     if (!loginAvailProc.running) loginAvailProc.running = true
   }
 
+  function refreshCounts() {
+    if (!countsProc.running) countsProc.running = true
+  }
+
   function applyStatus(raw) {
     var data = Model.parseJson(raw)
+    workspaceCount = parseInt(data.workspaces, 10) || 0
     if (!data.ok || !data.has_token) {
       tokenState = "none"
       return
@@ -129,35 +151,136 @@ Item {
       tokenState = "valid"
       teamName = String(data.team || "")
       selfName = String(data.user || "")
-      if (!countsProc.running) countsProc.running = true
+      if (data.team_id) {
+        teamId = String(data.team_id)
+        if (activeTeam === "") activeTeam = teamId
+      }
+      refreshCounts()
+    } else if (workspaceCount > 1) {
+      // The active workspace's token is bad, but the others may be fine.
+      // Show the app so the rail can offer them, and let counts-all say which
+      // one is broken, rather than hiding everything behind the sign-in view.
+      tokenState = "valid"
+      refreshCounts()
     } else {
       tokenState = String(data.error || "") === "network" ? "unknown" : "invalid"
     }
   }
 
+  // One counts-all payload feeds both the rail and the active workspace.
   function applyCounts(raw) {
     var data = Model.parseJson(raw)
     if (!data.ok) {
       var e = String(data.error || "")
-      if (e === "invalid_auth" || e === "token_revoked" || e === "token_expired" || e === "account_inactive")
-        tokenState = "invalid"
       if (e === "no token") tokenState = "none"
       countsError = Model.friendlyError(e)
       return
     }
-    counts = data
-    countsError = ""
-    selfId = String(data.self_id || "")
-    if (data.team) teamName = String(data.team)
-    if (data.team_id) teamId = String(data.team_id)
+    countsAllData = data
     if (data.seen) seenMap = data.seen
+    workspaces = Model.workspaceSummaries(data)
+    workspaceCount = parseInt(data.registered, 10) || workspaces.length
+    // Follow the script's recorded active workspace until the user picks one,
+    // and recover if the one we were on has just been signed out.
+    if (activeTeam === "" || !Model.workspaceIn(data, activeTeam))
+      activeTeam = String(data.active || (workspaces.length > 0 ? workspaces[0].teamId : ""))
+    adoptActiveWorkspace()
+  }
+
+  // Point the sidebar and message pane at whichever workspace is active.
+  function adoptActiveWorkspace() {
+    var w = Model.workspaceIn(countsAllData, activeTeam)
+    if (!w) {
+      counts = null
+      return
+    }
+    if (w.ok !== true) {
+      counts = null
+      var e = String(w.error || "")
+      // A rejected token drops you to the sign-in screen only when it is the
+      // one workspace there is; otherwise say so inline and let the user
+      // switch to one that still works rather than losing the whole rail.
+      if (!multiWorkspace
+          && (e === "invalid_auth" || e === "token_revoked" || e === "token_expired" || e === "account_inactive"))
+        tokenState = "invalid"
+      countsError = Model.friendlyError(e)
+      return
+    }
+    counts = w
+    countsError = ""
+    teamId = String(w.team_id || "")
+    teamName = String(w.team || "")
+    selfName = String(w.self || "")
+    selfId = String(w.self_id || "")
+  }
+
+  // Switching is a full reset of the message pane: a channel or user id from
+  // one workspace means nothing in another.
+  function switchWorkspace(tid) {
+    if (!tid || String(tid) === activeTeam) return
+    if (convo) lastConvo[activeTeam] = convo.id
+    activeTeam = String(tid)
+    settingsMode = false
+    addingWorkspace = false
+    convo = null
+    messages = []
+    threadTs = ""
+    threadMessages = []
+    threadError = ""
+    selectedMsg = -1
+    historyError = ""
+    historyNote = ""
+    sendError = ""
+    countsError = ""
+    counts = null
+    filterField.text = ""
+    composeField.text = ""
+    adoptActiveWorkspace()
+    // Remember the choice for the next launch, and for anything else reading
+    // the registry.
+    actionProc.cmd = Model.useCommand(scriptDir, activeTeam)
+    actionProc.running = true
+    // Land back on the conversation left open here, when it is still listed.
+    var back = lastConvo[activeTeam]
+    if (back) {
+      var rows = conversations
+      for (var i = 0; i < rows.length; i++)
+        if (rows[i].id === back) { openConvo(rows[i]); return }
+    }
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function switchWorkspaceAt(i) {
+    if (!multiWorkspace || i < 0 || i >= workspaces.length) return
+    switchWorkspace(workspaces[i].teamId)
+  }
+
+  // Adding a workspace reuses the sign-in view; the token itself says which
+  // workspace it belongs to, so nothing has to be picked here.
+  function beginAddWorkspace() {
+    addingWorkspace = true
+    settingsMode = false
+    loginFeedback = ""
+    tokenFeedback = ""
+    showTokenEntry = !loginAvailable
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function cancelAddWorkspace() {
+    if (loginBusy) cancelLogin()
+    addingWorkspace = false
+    showTokenEntry = false
+    loginFeedback = ""
+    tokenFeedback = ""
   }
 
   function applyHistory(raw) {
     historyLoading = false
     var data = Model.parseJson(raw)
     // A fetch started for one conversation may land after the user switched
-    // to another — drop it instead of rendering (and marking read) wrongly.
+    // to another — or to another workspace — so drop it instead of rendering
+    // (and marking read) wrongly.
+    if (data.team_id && data.team_id !== activeTeam) return
     if (!convo || (data.channel && data.channel !== convo.id)) return
     if (!data.ok) {
       historyError = Model.friendlyError(data.error)
@@ -187,6 +310,8 @@ Item {
     historyError = ""
     historyNote = ""
     sendError = ""
+    // Leaving deliberately also forgets it as this workspace's resume point.
+    if (activeTeam !== "") delete lastConvo[activeTeam]
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -249,7 +374,7 @@ Item {
     threadLoading = true
     selectedMsg = -1
     if (threadProc.running) threadProc.running = false
-    threadProc.cmd = Model.threadCommand(scriptDir, convo.id, tts)
+    threadProc.cmd = Model.threadCommand(scriptDir, activeTeam, convo.id, tts)
     threadProc.running = true
   }
 
@@ -270,6 +395,7 @@ Item {
   function applyThread(raw) {
     threadLoading = false
     var data = Model.parseJson(raw)
+    if (data.team_id && data.team_id !== activeTeam) return
     if (!convo || (data.channel && data.channel !== convo.id)) return
     if (data.thread_ts && data.thread_ts !== threadTs) return
     if (!data.ok) { threadError = Model.friendlyError(data.error); return }
@@ -281,11 +407,14 @@ Item {
   // Records the read marker (shared with the bar badge via seen.json) and
   // best-effort syncs other Slack clients via conversations.mark.
   function markSeen(id, ts) {
+    // The marker map is shared by every workspace, so it keys on
+    // "<team>/<channel>" — see Model.applyLocalRead.
+    var key = activeTeam + "/" + id
     var map = {}
     for (var k in seenMap) map[k] = seenMap[k]
-    if (!map[id] || parseFloat(map[id]) < parseFloat(ts)) map[id] = String(ts)
+    if (!map[key] || parseFloat(map[key]) < parseFloat(ts)) map[key] = String(ts)
     seenMap = map
-    seenProc.cmd = Model.seenCommand(scriptDir, id, ts)
+    seenProc.cmd = Model.seenCommand(scriptDir, activeTeam, id, ts)
     seenProc.running = true
   }
 
@@ -293,7 +422,8 @@ Item {
     settingsMode = false
     convo = { id: c.id, name: Model.displayName(c), kind: c.kind, latest: String(c.latest || "") }
     // Snapshot the read boundary before markSeen (on load) advances it.
-    unreadBoundaryTs = seenMap[c.id] ? String(seenMap[c.id]) : ""
+    var seenKey = c.key || (activeTeam + "/" + c.id)
+    unreadBoundaryTs = seenMap[seenKey] ? String(seenMap[seenKey]) : ""
     selectedMsg = -1
     threadTs = ""
     threadMessages = []
@@ -304,7 +434,7 @@ Item {
     historyLoading = true
     composeField.text = ""
     if (historyProc.running) historyProc.running = false
-    historyProc.cmd = Model.historyCommand(scriptDir, convo.id)
+    historyProc.cmd = Model.historyCommand(scriptDir, activeTeam, convo.id)
     historyProc.running = true
     Qt.callLater(function() { composeField.forceActiveFocus() })
   }
@@ -312,7 +442,7 @@ Item {
   function refreshHistory() {
     if (!convo || historyProc.running) return
     historyLoading = true
-    historyProc.cmd = Model.historyCommand(scriptDir, convo.id)
+    historyProc.cmd = Model.historyCommand(scriptDir, activeTeam, convo.id)
     historyProc.running = true
   }
 
@@ -324,7 +454,8 @@ Item {
     // Snapshot the destination now — a live binding could re-resolve to a
     // different conversation between here and process start. In a thread,
     // reply into it (thread_ts).
-    sendProc.cmd = Model.sendCommand(scriptDir, convo.id, threadTs !== "" ? threadTs : "")
+    sendProc.cmd = Model.sendCommand(scriptDir, activeTeam, convo.id, threadTs !== "" ? threadTs : "")
+    sendProc.team = activeTeam
     sendProc.intoThread = threadTs !== ""
     sendProc.pendingText = String(text)
     sendProc.stdinEnabled = true
@@ -334,6 +465,10 @@ Item {
   function sendFinished(raw) {
     sending = false
     var data = Model.parseJson(raw)
+    // The reply belongs to the workspace it was sent from; if that is no
+    // longer the one on screen, appending it here would show it in the wrong
+    // conversation.
+    if (sendProc.team !== activeTeam) return
     if (!data.ok) {
       sendError = Model.friendlyError(data.error)
       return
@@ -391,11 +526,27 @@ Item {
       return
     }
     loginFeedback = ""
+    adoptNewWorkspace(data)
+  }
+
+  // A fresh sign-in — first workspace or an added one — becomes the active
+  // workspace; the token itself told the script which workspace that is.
+  function adoptNewWorkspace(data) {
+    addingWorkspace = false
+    showTokenEntry = false
     tokenState = "valid"
+    if (data.team_id) activeTeam = String(data.team_id)
+    teamId = String(data.team_id || "")
     teamName = String(data.team || "")
     selfName = String(data.user || "")
     selfId = String(data.user_id || "")
-    if (!countsProc.running) countsProc.running = true
+    workspaceCount = parseInt(data.workspaces, 10) || workspaceCount
+    convo = null
+    messages = []
+    threadTs = ""
+    threadMessages = []
+    counts = null
+    refreshCounts()
   }
 
   function submitToken() {
@@ -417,34 +568,90 @@ Item {
       return
     }
     tokenFeedback = ""
-    tokenState = "valid"
-    teamName = String(data.team || "")
-    selfName = String(data.user || "")
-    selfId = String(data.user_id || "")
-    if (!countsProc.running) countsProc.running = true
+    adoptNewWorkspace(data)
   }
 
-  function signOut() {
-    actionProc.cmd = Model.clearTokenCommand(scriptDir)
+  // Sign out of any workspace. Doing this without switching to it first
+  // matters: switching would fire `use` on the same Process this then reuses
+  // for `clear-token`, and the second command would clobber the first.
+  function signOutWorkspace(tid) {
+    if (!tid) return
+    if (String(tid) === activeTeam) { signOut(); return }
+    actionProc.cmd = Model.clearTokenCommand(scriptDir, String(tid))
     actionProc.running = true
-    tokenState = "none"
+    var left = []
+    for (var i = 0; i < workspaces.length; i++)
+      if (workspaces[i].teamId !== String(tid)) left.push(workspaces[i])
+    workspaces = left
+    workspaceCount = Math.max(0, workspaceCount - 1)
+    delete lastConvo[String(tid)]
+  }
+
+  // Sign out of the active workspace. Whatever is left takes over, so
+  // signing out of one of several never drops you to the sign-in screen.
+  function signOut() {
+    var gone = activeTeam
+    actionProc.cmd = Model.clearTokenCommand(scriptDir, gone)
+    actionProc.running = true
+    var left = []
+    for (var i = 0; i < workspaces.length; i++)
+      if (workspaces[i].teamId !== gone) left.push(workspaces[i])
+    workspaces = left
+    workspaceCount = left.length
+    countsAllData = null
     counts = null
     convo = null
     messages = []
+    threadTs = ""
+    threadMessages = []
+    settingsMode = false
+    if (gone !== "") delete lastConvo[gone]
+    if (left.length > 0) {
+      activeTeam = left[0].teamId
+      teamId = left[0].teamId
+      teamName = left[0].team
+      selfName = ""
+      selfId = ""
+    } else {
+      tokenState = "none"
+      activeTeam = ""
+      teamId = ""
+      teamName = ""
+      selfName = ""
+      selfId = ""
+    }
+  }
+
+  function signOutAll() {
+    actionProc.cmd = Model.clearAllTokensCommand(scriptDir)
+    actionProc.running = true
+    tokenState = "none"
+    workspaces = []
+    workspaceCount = 0
+    countsAllData = null
+    counts = null
+    activeTeam = ""
+    teamId = ""
     teamName = ""
     selfName = ""
+    selfId = ""
+    convo = null
+    messages = []
+    threadTs = ""
+    threadMessages = []
+    lastConvo = ({})
     settingsMode = false
   }
 
   function togglePresence() {
     if (tokenState !== "valid") return
-    actionProc.cmd = Model.presenceCommand(scriptDir, presence === "away" ? "auto" : "away")
+    actionProc.cmd = Model.presenceCommand(scriptDir, activeTeam, presence === "away" ? "auto" : "away")
     actionProc.running = true
   }
 
   function toggleSnooze() {
     if (tokenState !== "valid") return
-    actionProc.cmd = snoozing ? Model.unsnoozeCommand(scriptDir) : Model.snoozeCommand(scriptDir, 60)
+    actionProc.cmd = snoozing ? Model.unsnoozeCommand(scriptDir, activeTeam) : Model.snoozeCommand(scriptDir, activeTeam, 60)
     actionProc.running = true
   }
 
@@ -483,9 +690,11 @@ Item {
     }
   }
 
+  // Every signed-in workspace in one payload: the rail's per-workspace badges
+  // and the active workspace's sidebar both come out of this.
   Process {
     id: countsProc
-    command: Model.countsCommand(root.scriptDir, true)
+    command: Model.countsAllCommand(root.scriptDir, true)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyCounts(text)
@@ -517,6 +726,7 @@ Item {
   Process {
     id: sendProc
     property string pendingText: ""
+    property string team: ""
     property bool intoThread: false
     property var cmd: ["true"]
     command: cmd
@@ -569,7 +779,7 @@ Item {
     command: cmd
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: if (root.tokenState === "valid" && !countsProc.running) countsProc.running = true
+      onStreamFinished: if (root.tokenState === "valid") root.refreshCounts()
     }
   }
 
@@ -578,7 +788,7 @@ Item {
     interval: 90 * 1000
     running: root.opened && root.tokenState === "valid"
     repeat: true
-    onTriggered: if (!countsProc.running) countsProc.running = true
+    onTriggered: root.refreshCounts()
   }
 
   // The open conversation refreshes on Slack's history cadence (1/min).
@@ -624,7 +834,8 @@ Item {
           }
           var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
           if (event.key === Qt.Key_Escape) {
-            if (root.threadTs !== "") root.closeThread()
+            if (root.addingWorkspace) root.cancelAddWorkspace()
+            else if (root.threadTs !== "") root.closeThread()
             else if (inConvo) root.backToList()
             else root.dismiss()
             event.accepted = true
@@ -636,6 +847,11 @@ Item {
             event.accepted = true
           } else if (ctrl && event.key === Qt.Key_K) {
             root.selectStep(-1)
+            event.accepted = true
+
+          // Ctrl+1…9 jumps straight to a workspace, in rail order.
+          } else if (ctrl && event.key >= Qt.Key_1 && event.key <= Qt.Key_9) {
+            root.switchWorkspaceAt(event.key - Qt.Key_1)
             event.accepted = true
 
           } else if (event.key === Qt.Key_Question || (ctrl && event.key === Qt.Key_Slash)) {
@@ -692,9 +908,11 @@ Item {
           }
         }
 
-        // ========================= SIGNED OUT =========================
+        // ============== SIGNED OUT / ADDING A WORKSPACE ===============
+        // Adding a workspace reuses this whole view: the flow is identical,
+        // and the token says which workspace it is for.
         Column {
-          visible: root.tokenState !== "valid"
+          visible: root.tokenState !== "valid" || root.addingWorkspace
           anchors.centerIn: parent
           width: Math.min(parent.width - Style.space(40), Style.space(420))
           spacing: Style.space(14)
@@ -711,7 +929,7 @@ Item {
           Text {
             textFormat: Text.PlainText
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "Omarchy Slack"
+            text: root.addingWorkspace ? "Add a workspace" : "Omarchy Slack"
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
@@ -721,9 +939,11 @@ Item {
           Text {
             textFormat: Text.PlainText
             width: parent.width
-            text: root.tokenState === "invalid"
-              ? "Slack rejected the saved sign-in. Sign in again to continue."
-              : "Your Slack, themed like your desktop — sign in to get started."
+            text: root.addingWorkspace
+              ? "Sign in to another Slack workspace. You'll be able to switch between them from the rail on the left."
+              : (root.tokenState === "invalid"
+                ? "Slack rejected the saved sign-in. Sign in again to continue."
+                : "Your Slack, themed like your desktop — sign in to get started.")
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -828,6 +1048,26 @@ Item {
             horizontalAlignment: Text.AlignHCenter
           }
 
+          // Only when adding: a way back to the workspace you were in.
+          Text {
+            textFormat: Text.PlainText
+            visible: root.addingWorkspace && !root.loginBusy
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "‹ back"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.underline: addBackArea.containsMouse
+
+            MouseArea {
+              id: addBackArea
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.cancelAddWorkspace()
+            }
+          }
+
           // Advanced: paste a token instead of the browser flow.
           Text {
             textFormat: Text.PlainText
@@ -915,9 +1155,136 @@ Item {
 
         // ========================== SIGNED IN ==========================
         Row {
-          visible: root.tokenState === "valid"
+          visible: root.tokenState === "valid" && !root.addingWorkspace
           anchors.fill: parent
           spacing: root.contentMargin
+
+          // ---------------------- WORKSPACE RAIL ----------------------
+          // Only exists once there is something to switch between. With a
+          // single workspace this is not rendered at all and the layout is
+          // byte-for-byte what it was before.
+          Column {
+            id: workspaceRail
+            visible: root.multiWorkspace
+            width: visible ? root.railWidth : 0
+            height: parent.height
+            spacing: Style.space(6)
+
+            Repeater {
+              model: root.workspaces
+
+              Item {
+                id: wsTile
+                required property var modelData
+                width: root.railWidth
+                height: root.railWidth
+                readonly property bool current: modelData.teamId === root.activeTeam
+
+                Rectangle {
+                  anchors.centerIn: parent
+                  width: Style.space(34)
+                  height: Style.space(34)
+                  // Slack's own tell: the active workspace squares off.
+                  radius: wsTile.current ? root.cornerRadius : height / 2
+                  color: wsTile.current
+                    ? Color.accent
+                    : (wsArea.containsMouse ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent")
+                  border.width: wsTile.current ? 0 : 1
+                  border.color: wsTile.modelData.ok
+                    ? Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.45)
+                    : Qt.rgba(Color.urgent.r, Color.urgent.g, Color.urgent.b, 0.6)
+
+                  Text {
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: wsTile.modelData.initial
+                    color: wsTile.current ? Color.background : root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                  }
+
+                  MouseArea {
+                    id: wsArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.switchWorkspace(wsTile.modelData.teamId)
+                  }
+                }
+
+                // Unread DMs in that workspace — the number that means
+                // someone is waiting on you there.
+                Rectangle {
+                  visible: wsTile.modelData.mentions > 0
+                  width: Math.max(height, wsBadgeText.implicitWidth + Style.space(4))
+                  height: Style.space(13)
+                  radius: height / 2
+                  color: Color.urgent
+                  anchors.top: parent.top
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(2)
+
+                  Text {
+                    id: wsBadgeText
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: wsTile.modelData.mentions > 99 ? "99+" : wsTile.modelData.mentions
+                    color: Color.background
+                    font.family: root.fontFamily
+                    font.pixelSize: Math.max(8, Style.font.caption - 2)
+                    font.bold: true
+                  }
+                }
+
+                // Channels-only unread: a quiet dot, matching the sidebar.
+                Rectangle {
+                  visible: wsTile.modelData.mentions === 0 && wsTile.modelData.unreadChannels > 0
+                  width: Style.space(6)
+                  height: Style.space(6)
+                  radius: height / 2
+                  color: Color.accent
+                  anchors.top: parent.top
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(5)
+                  anchors.topMargin: Style.space(3)
+                }
+              }
+            }
+
+            // Add another workspace.
+            Item {
+              width: root.railWidth
+              height: root.railWidth
+
+              Rectangle {
+                anchors.centerIn: parent
+                width: Style.space(34)
+                height: Style.space(34)
+                radius: height / 2
+                color: railAddArea.containsMouse ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+                border.width: 1
+                border.color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.35)
+
+                Text {
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: "+"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                MouseArea {
+                  id: railAddArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.beginAddWorkspace()
+                }
+              }
+            }
+          }
 
           // ------------------------- SIDEBAR -------------------------
           Column {
@@ -1437,6 +1804,7 @@ Item {
           // ------------------------ CHAT PANE ------------------------
           Column {
             width: parent.width - root.sidebarWidth - 1 - root.contentMargin * 2
+                   - (workspaceRail.visible ? root.railWidth + root.contentMargin : 0)
             height: parent.height
             spacing: Style.space(8)
 
@@ -1478,11 +1846,107 @@ Item {
               Text {
                 textFormat: Text.PlainText
                 width: parent.width
-                text: "The bar badge counts unread DMs and group DMs; channels light the icon. Unread counts poll every few minutes (omarchy bar set bottelet.slack refreshMinutes N)."
+                text: root.multiWorkspace
+                  ? "The bar badge counts unread DMs and group DMs across every workspace; channels light the icon. Unread counts poll every few minutes (omarchy bar set bottelet.slack refreshMinutes N)."
+                  : "The bar badge counts unread DMs and group DMs; channels light the icon. Unread counts poll every few minutes (omarchy bar set bottelet.slack refreshMinutes N)."
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.WordWrap
+              }
+
+              // ---- workspaces ----
+              Text {
+                textFormat: Text.PlainText
+                visible: root.multiWorkspace
+                text: "WORKSPACES"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1
+                topPadding: Style.space(6)
+              }
+
+              Repeater {
+                model: root.multiWorkspace ? root.workspaces : []
+
+                Item {
+                  id: wsSetting
+                  required property var modelData
+                  width: parent.width
+                  height: Style.space(26)
+
+                  readonly property bool current: modelData.teamId === root.activeTeam
+
+                  Text {
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    textFormat: Text.PlainText
+                    text: (wsSetting.current ? "● " : "○ ") + wsSetting.modelData.team
+                      + (wsSetting.modelData.ok ? "" : " — " + wsSetting.modelData.error)
+                    color: wsSetting.modelData.ok ? root.foreground : Color.urgent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
+                    width: parent.width - Style.space(80)
+
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.switchWorkspace(wsSetting.modelData.teamId)
+                    }
+                  }
+
+                  Text {
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    textFormat: Text.PlainText
+                    text: "sign out"
+                    color: wsSignOutArea.containsMouse ? Color.urgent : root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.underline: wsSignOutArea.containsMouse
+
+                    MouseArea {
+                      id: wsSignOutArea
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.signOutWorkspace(wsSetting.modelData.teamId)
+                    }
+                  }
+                }
+              }
+
+              // The only route from one workspace to two, which is why it
+              // lives here rather than in the sidebar: it adds no chrome to
+              // the single-workspace app.
+              Rectangle {
+                width: addWsText.implicitWidth + Style.space(20)
+                height: addWsText.implicitHeight + Style.space(12)
+                radius: root.cornerRadius
+                color: addWsArea.containsMouse ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+                border.width: 1
+                border.color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.45)
+
+                Text {
+                  id: addWsText
+                  textFormat: Text.PlainText
+                  anchors.centerIn: parent
+                  text: "+  Add another workspace"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                MouseArea {
+                  id: addWsArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.beginAddWorkspace()
+                }
               }
 
               Rectangle {
@@ -1497,7 +1961,9 @@ Item {
                   textFormat: Text.PlainText
                   id: signOutText
                   anchors.centerIn: parent
-                  text: "  Sign out & forget token"
+                  text: root.multiWorkspace
+                    ? "  Sign out of " + root.teamName
+                    : "  Sign out & forget token"
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -1509,6 +1975,34 @@ Item {
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
                   onClicked: root.signOut()
+                }
+              }
+
+              Rectangle {
+                visible: root.multiWorkspace
+                width: signOutAllText.implicitWidth + Style.space(20)
+                height: signOutAllText.implicitHeight + Style.space(12)
+                radius: root.cornerRadius
+                color: signOutAllArea.containsMouse ? Style.hoverFillFor(root.foreground, Color.urgent) : "transparent"
+                border.width: 1
+                border.color: Qt.rgba(root.dim.r, root.dim.g, root.dim.b, 0.45)
+
+                Text {
+                  textFormat: Text.PlainText
+                  id: signOutAllText
+                  anchors.centerIn: parent
+                  text: "  Sign out of all workspaces"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                MouseArea {
+                  id: signOutAllArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.signOutAll()
                 }
               }
             }
@@ -2162,7 +2656,8 @@ Item {
             }
 
             Repeater {
-              model: [
+              model: (root.multiWorkspace
+                ? [{ k: "Ctrl+1…9", d: "Switch workspace" }] : []).concat([
                 { k: "↑/↓ · Ctrl+J/K", d: "Move between conversations" },
                 { k: "/", d: "Filter conversations" },
                 { k: "Enter", d: "Open filtered / open selected link" },
@@ -2175,7 +2670,7 @@ Item {
                 { k: "i", d: "Jump to the message box" },
                 { k: "Esc", d: "Close thread / back to list / close app" },
                 { k: "?  or  Ctrl+/", d: "Toggle this help" }
-              ]
+              ])
               Row {
                 required property var modelData
                 spacing: Style.space(12)

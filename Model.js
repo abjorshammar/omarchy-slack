@@ -12,29 +12,54 @@ function script(scriptDir) {
   return scriptDir + "slack.sh"
 }
 
-function countsCommand(scriptDir, showChannels) {
-  var types = showChannels
-    ? "im,mpim,public_channel,private_channel"
-    : "im,mpim"
-  return ["bash", script(scriptDir), "counts", types]
+// Every command names the workspace it acts on. Passing the team explicitly,
+// rather than leaning on the script's active workspace, is what keeps a reply
+// that lands after the user has switched attributable to where it came from.
+// Sign-in is the exception: the workspace is learned from the token itself.
+function base(scriptDir, teamId) {
+  var a = ["bash", script(scriptDir)]
+  if (teamId) a.push("--team", String(teamId))
+  return a
 }
 
-function historyCommand(scriptDir, channelId) {
-  return ["bash", script(scriptDir), "history", String(channelId)]
+function convTypes(showChannels) {
+  return showChannels ? "im,mpim,public_channel,private_channel" : "im,mpim"
 }
 
-function sendCommand(scriptDir, channelId, threadTs) {
-  var a = ["bash", script(scriptDir), "send", String(channelId)]
+function countsCommand(scriptDir, teamId, showChannels) {
+  return base(scriptDir, teamId).concat(["counts", convTypes(showChannels)])
+}
+
+// One payload covering every signed-in workspace, so neither the bar widget
+// nor the workspace rail has to fan out into a process per workspace.
+function countsAllCommand(scriptDir, showChannels) {
+  return ["bash", script(scriptDir), "counts-all", convTypes(showChannels)]
+}
+
+function workspacesCommand(scriptDir) {
+  return ["bash", script(scriptDir), "workspaces"]
+}
+
+function useCommand(scriptDir, teamId) {
+  return ["bash", script(scriptDir), "use", String(teamId)]
+}
+
+function historyCommand(scriptDir, teamId, channelId) {
+  return base(scriptDir, teamId).concat(["history", String(channelId)])
+}
+
+function sendCommand(scriptDir, teamId, channelId, threadTs) {
+  var a = base(scriptDir, teamId).concat(["send", String(channelId)])
   if (threadTs) a.push(String(threadTs))
   return a
 }
 
-function threadCommand(scriptDir, channelId, ts) {
-  return ["bash", script(scriptDir), "thread", String(channelId), String(ts)]
+function threadCommand(scriptDir, teamId, channelId, ts) {
+  return base(scriptDir, teamId).concat(["thread", String(channelId), String(ts)])
 }
 
-function seenCommand(scriptDir, channelId, ts) {
-  return ["bash", script(scriptDir), "seen", String(channelId), String(ts)]
+function seenCommand(scriptDir, teamId, channelId, ts) {
+  return base(scriptDir, teamId).concat(["seen", String(channelId), String(ts)])
 }
 
 function loginCommand(scriptDir) {
@@ -45,28 +70,35 @@ function loginAvailableCommand(scriptDir) {
   return ["bash", script(scriptDir), "login-available"]
 }
 
-function presenceCommand(scriptDir, presence) {
-  return ["bash", script(scriptDir), "presence", presence === "away" ? "away" : "auto"]
+function presenceCommand(scriptDir, teamId, presence) {
+  return base(scriptDir, teamId).concat(["presence", presence === "away" ? "away" : "auto"])
 }
 
-function snoozeCommand(scriptDir, minutes) {
-  return ["bash", script(scriptDir), "snooze", String(parseInt(minutes, 10) || 60)]
+function snoozeCommand(scriptDir, teamId, minutes) {
+  return base(scriptDir, teamId).concat(["snooze", String(parseInt(minutes, 10) || 60)])
 }
 
-function unsnoozeCommand(scriptDir) {
-  return ["bash", script(scriptDir), "unsnooze"]
+function unsnoozeCommand(scriptDir, teamId) {
+  return base(scriptDir, teamId).concat(["unsnooze"])
 }
 
-function statusCommand(scriptDir) {
-  return ["bash", script(scriptDir), "status"]
+function statusCommand(scriptDir, teamId) {
+  return base(scriptDir, teamId).concat(["status"])
 }
 
 function setTokenCommand(scriptDir) {
   return ["bash", script(scriptDir), "set-token"]
 }
 
-function clearTokenCommand(scriptDir) {
-  return ["bash", script(scriptDir), "clear-token"]
+// No team: forget the active workspace. With one: forget just that workspace.
+function clearTokenCommand(scriptDir, teamId) {
+  var a = ["bash", script(scriptDir), "clear-token"]
+  if (teamId) a.push("--team", String(teamId))
+  return a
+}
+
+function clearAllTokensCommand(scriptDir) {
+  return ["bash", script(scriptDir), "clear-token", "--all"]
 }
 
 // ----------------------------------------------------------------- parsing
@@ -117,7 +149,10 @@ function sortConversations(convs) {
 
 // A conversation counts as read locally once the user has viewed messages at
 // or past its latest ts here, even when the token lacks the optional write
-// scopes for conversations.mark (localRead is persisted in settings).
+// scopes for conversations.mark. The marker map is shared by every workspace
+// (one file, one watcher in the bar widget), so it keys on the conversation's
+// `key` — "<team_id>/<channel_id>" — not the channel id, which is only unique
+// within a workspace.
 function applyLocalRead(convs, localRead) {
   var seen = localRead || {}
   var out = []
@@ -127,7 +162,7 @@ function applyLocalRead(convs, localRead) {
     for (var k in c) copy[k] = c[k]
     var unread = parseInt(c.unread, 10) || 0
     var latest = String(c.latest || "")
-    var mark = String(seen[c.id] || "")
+    var mark = String(seen[c.key || c.id] || "")
     if (unread > 0 && latest !== "" && mark !== "" && parseFloat(mark) >= parseFloat(latest))
       unread = 0
     copy.effectiveUnread = unread
@@ -156,6 +191,62 @@ function unreadChannelCount(convs) {
   }
   return n
 }
+
+// -------------------------------------------------------------- workspaces
+
+// The tile letter for a workspace in the rail.
+function teamInitial(name) {
+  var s = String(name || "").replace(/^\s+/, "")
+  return s === "" ? "?" : s.charAt(0).toUpperCase()
+}
+
+// One workspace out of a counts-all payload, or null.
+function workspaceIn(data, teamId) {
+  var ws = (data && data.workspaces) || []
+  for (var i = 0; i < ws.length; i++)
+    if (String(ws[i].team_id || "") === String(teamId)) return ws[i]
+  return null
+}
+
+// counts-all → one row per workspace for the rail, each carrying its own
+// unread totals. A workspace whose poll failed still gets a row (with the
+// reason), so its tile stays put instead of blinking out of the rail.
+function workspaceSummaries(data) {
+  var ws = (data && data.workspaces) || []
+  var seen = (data && data.seen) || {}
+  var out = []
+  for (var i = 0; i < ws.length; i++) {
+    var w = ws[i]
+    var ok = w.ok === true
+    var convs = ok ? applyLocalRead(w.conversations, seen) : []
+    out.push({
+      teamId: String(w.team_id || ""),
+      team: String(w.team || w.team_id || ""),
+      initial: teamInitial(w.team || w.team_id),
+      ok: ok,
+      error: ok ? "" : friendlyError(w.error),
+      mentions: mentionCount(convs),
+      unreadChannels: unreadChannelCount(convs)
+    })
+  }
+  return out
+}
+
+// Bar badge across every signed-in workspace: one number for "someone is
+// waiting on you somewhere".
+function totalMentions(summaries) {
+  var n = 0
+  for (var i = 0; i < (summaries || []).length; i++) n += summaries[i].mentions || 0
+  return n
+}
+
+function totalUnreadChannels(summaries) {
+  var n = 0
+  for (var i = 0; i < (summaries || []).length; i++) n += summaries[i].unreadChannels || 0
+  return n
+}
+
+// ------------------------------------------------------------------ sidebar
 
 // Case-insensitive substring filter over display names, for the sidebar.
 function filterConversations(convs, query) {
@@ -202,11 +293,11 @@ function userAvatar(users, id) {
 }
 
 // Avatars are either a local PNG the script converted (Slack serves webp,
-// which Qt can't decode) under the plugin's own cache dir, or — as a
+// which Qt can't decode) under that workspace's own cache dir, or — as a
 // fallback — a URL on Slack's own image hosts. Nothing else is accepted.
 function validAvatar(x) {
   var s = String(x || "")
-  return /\/omarchy-slack\/avatars\/[UW][A-Z0-9]+\.png$/.test(s)
+  return /\/omarchy-slack\/[TE][A-Z0-9]+\/avatars\/[UW][A-Z0-9]+\.png$/.test(s)
       || /^https:\/\/(secure\.gravatar\.com|[a-z0-9.-]*\.slack-edge\.com)\//.test(s)
 }
 
@@ -428,6 +519,9 @@ function snoozeLabel(until) {
 if (typeof module !== "undefined") {
   module.exports = {
     countsCommand: countsCommand,
+    countsAllCommand: countsAllCommand,
+    workspacesCommand: workspacesCommand,
+    useCommand: useCommand,
     historyCommand: historyCommand,
     sendCommand: sendCommand,
     threadCommand: threadCommand,
@@ -441,6 +535,12 @@ if (typeof module !== "undefined") {
     statusCommand: statusCommand,
     setTokenCommand: setTokenCommand,
     clearTokenCommand: clearTokenCommand,
+    clearAllTokensCommand: clearAllTokensCommand,
+    teamInitial: teamInitial,
+    workspaceIn: workspaceIn,
+    workspaceSummaries: workspaceSummaries,
+    totalMentions: totalMentions,
+    totalUnreadChannels: totalUnreadChannels,
     parseJson: parseJson,
     friendlyError: friendlyError,
     sortConversations: sortConversations,

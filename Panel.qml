@@ -103,6 +103,9 @@ Item {
   property string threadTs: ""
   property var threadMessages: []
   property bool threadLoading: false
+  // A file staged for the next send: {path, name}. There is no file dialog on
+  // this desktop, so it is staged by pasting an image or dropping a file.
+  property var pendingFile: null
   property string threadError: ""
   readonly property var displayMessages: threadTs !== "" ? threadMessages : messages
 
@@ -458,18 +461,42 @@ Item {
     historyProc.running = true
   }
 
+  function attachFromClipboard() {
+    if (sending || clipProc.running) return
+    clipProc.running = true
+  }
+
+  function attachPath(path) {
+    var p = String(path || "")
+    if (p === "" || sending) return
+    sendError = ""
+    pendingFile = { path: p, name: Model.baseName(p) }
+  }
+
+  function clearAttachment() {
+    pendingFile = null
+  }
+
   function sendMessage() {
-    var text = composeField.text
-    if (!convo || sending || String(text).replace(/\s+/g, "") === "") return
+    var text = String(composeField.text)
+    if (!convo || sending) return
+    // A staged file can go on its own; plain text still cannot be empty.
+    if (!pendingFile && text.replace(/\s+/g, "") === "") return
     sending = true
     sendError = ""
     // Snapshot the destination now — a live binding could re-resolve to a
     // different conversation between here and process start. In a thread,
     // reply into it (thread_ts).
-    sendProc.cmd = Model.sendCommand(scriptDir, activeTeam, convo.id, threadTs !== "" ? threadTs : "")
+    var tt = threadTs !== "" ? threadTs : ""
+    sendProc.cmd = pendingFile
+      ? Model.uploadCommand(scriptDir, activeTeam, convo.id, pendingFile.path, tt)
+      : Model.sendCommand(scriptDir, activeTeam, convo.id, tt)
     sendProc.team = activeTeam
     sendProc.intoThread = threadTs !== ""
-    sendProc.pendingText = String(text)
+    // The upload takes its comment on stdin too, so text travels the same way
+    // it always has — never argv.
+    sendProc.pendingText = text
+    sendProc.pendingFileName = pendingFile ? pendingFile.name : ""
     sendProc.stdinEnabled = true
     sendProc.running = true
   }
@@ -498,7 +525,11 @@ Item {
       daySep: "",
       firstUnread: false,
       reactions: [],
-      files: [],
+      // The name only: the real thumbnail arrives with the next history
+      // refresh, at most a minute out, and Slack has not made one yet.
+      files: sendProc.pendingFileName !== ""
+        ? [{ id: "", name: sendProc.pendingFileName, size: "", path: "", w: 0, h: 0 }]
+        : [],
       time: Qt.formatTime(new Date(), "HH:mm"),
       url: Model.firstUrl(sendProc.pendingText),
       text: Model.formatMessage(sendProc.pendingText, {}),
@@ -510,8 +541,22 @@ Item {
       var mine = messages.slice(); mine.push(row); messages = mine
     }
     composeField.text = ""
+    clearAttachment()
     if (convo && data.ts) markSeen(convo.id, String(data.ts))
     scrollToBottom()
+  }
+
+  function clipFinished(raw) {
+    var data = Model.parseJson(raw)
+    if (!data.ok) {
+      // Ctrl+V is not claimed, so the field still pastes text normally and
+      // this fires on every text paste. "no image" is the ordinary case, not
+      // something to warn about; anything else is worth saying.
+      if (String(data.error) !== "no image on the clipboard")
+        sendError = Model.friendlyError(data.error)
+      return
+    }
+    attachPath(data.path)
   }
 
   function startLogin() {
@@ -804,6 +849,7 @@ Item {
   Process {
     id: sendProc
     property string pendingText: ""
+    property string pendingFileName: ""
     property string team: ""
     property bool intoThread: false
     property var cmd: ["true"]
@@ -816,6 +862,16 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.sendFinished(text)
+    }
+  }
+
+  // Whatever image is on the Wayland clipboard, written to a private file.
+  Process {
+    id: clipProc
+    command: Model.clipImageCommand(root.scriptDir)
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.clipFinished(text)
     }
   }
 
@@ -2215,6 +2271,33 @@ Item {
               width: parent.width
               height: parent.height - Style.space(24) - composeRow.height - Style.space(24)
 
+              // Drop a file anywhere over the conversation to stage it. The
+              // other half of "there is no file dialog on this desktop"; only
+              // local files, and only one — a send carries one attachment.
+              DropArea {
+                id: dropTarget
+                anchors.fill: parent
+                z: 10
+                onDropped: function(drop) {
+                  var urls = drop.urls || []
+                  for (var i = 0; i < urls.length; i++) {
+                    var p = Model.dropPath(urls[i])
+                    if (p !== "") { root.attachPath(p); drop.accept(); return }
+                  }
+                }
+              }
+
+              // A file is over the conversation and will be staged if dropped.
+              Rectangle {
+                anchors.fill: parent
+                z: 9
+                visible: dropTarget.containsDrag
+                color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.10)
+                border.width: 1
+                border.color: Color.accent
+                radius: root.cornerRadius
+              }
+
               Text {
                 textFormat: Text.PlainText
                 anchors.centerIn: parent
@@ -2626,6 +2709,56 @@ Item {
               }
             }
 
+            // What is staged for the next send. Clicking ✕ drops it; sending
+            // clears it. Kept above the compose box so it is impossible to
+            // send an attachment without having seen that it is attached.
+            Rectangle {
+              visible: !root.settingsMode && root.convo !== null && root.pendingFile !== null
+              width: chipRow.implicitWidth + Style.space(14)
+              height: chipRow.implicitHeight + Style.space(8)
+              radius: root.cornerRadius
+              color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.14)
+              border.width: 1
+              border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.5)
+
+              Row {
+                id: chipRow
+                anchors.centerIn: parent
+                spacing: Style.space(6)
+                Text {
+                  text: ""  // nf-fa-paperclip
+                  color: Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Math.max(8, Style.font.caption - 1)
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.pendingFile ? root.pendingFile.name : ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideMiddle
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Text {
+                  text: "✕"
+                  color: dropChipArea.containsMouse ? Color.urgent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                  MouseArea {
+                    id: dropChipArea
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(4)
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.clearAttachment()
+                  }
+                }
+              }
+            }
+
             Item {
               id: composeRow
               visible: !root.settingsMode && root.convo !== null
@@ -2649,6 +2782,11 @@ Item {
                   } else if (event.key === Qt.Key_Escape) {
                     keyCatcher.forceActiveFocus()
                     event.accepted = true
+                  } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_V) {
+                    // Screenshot, then paste — the way images actually get
+                    // sent. Only claim the key when the clipboard really
+                    // holds an image, so pasting text still pastes text.
+                    root.attachFromClipboard()
                   }
                 }
               }

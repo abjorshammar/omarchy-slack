@@ -18,7 +18,7 @@ unlisted apps), it takes about two minutes:
            "channels:read", "groups:read", "im:read", "mpim:read",
            "channels:history", "groups:history", "im:history", "mpim:history",
            "chat:write", "users:read", "dnd:read", "dnd:write", "users:write",
-           "files:read"
+           "files:read", "files:write"
          ]
        }
      }

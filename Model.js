@@ -59,6 +59,34 @@ function sendCommand(scriptDir, teamId, channelId, threadTs) {
   return a
 }
 
+// Share a local file. The path is argv, never a shell word; the script
+// re-checks it is a readable regular file within Slack's size limit.
+function uploadCommand(scriptDir, teamId, channelId, path, threadTs) {
+  var a = base(scriptDir, teamId).concat(["upload", String(channelId), String(path)])
+  if (threadTs) a.push(String(threadTs))
+  return a
+}
+
+// Write whatever image is on the Wayland clipboard to a private file.
+function clipImageCommand(scriptDir) {
+  return ["bash", script(scriptDir), "clip-image"]
+}
+
+// A dropped file arrives as a file:// URL. Anything else — a dragged link, a
+// remote image — is not a local file and there is nothing to upload.
+function dropPath(u) {
+  var s = String(u || "")
+  if (s.indexOf("file://") !== 0) return ""
+  var p = decodeURIComponent(s.substring(7))
+  return (p.charAt(0) === "/" && p.indexOf("\u0000") < 0) ? p : ""
+}
+
+function baseName(p) {
+  var s = String(p || "")
+  var i = s.lastIndexOf("/")
+  return i >= 0 ? s.substring(i + 1) : s
+}
+
 function threadCommand(scriptDir, teamId, channelId, ts) {
   return base(scriptDir, teamId).concat(["thread", String(channelId), String(ts)])
 }
@@ -568,6 +596,10 @@ if (typeof module !== "undefined") {
     countsCommand: countsCommand,
     countsAllCommand: countsAllCommand,
     countsCachedCommand: countsCachedCommand,
+    uploadCommand: uploadCommand,
+    clipImageCommand: clipImageCommand,
+    dropPath: dropPath,
+    baseName: baseName,
     workspacesCommand: workspacesCommand,
     useCommand: useCommand,
     historyCommand: historyCommand,

@@ -52,6 +52,22 @@
   downloads are batched the same way. A warm counts cycle drops from ~9s to
   ~2s; a cold open (empty caches) from ~15s to under 4s, with ~10× fewer
   processes spawned. Output is byte-for-byte unchanged.
+- **Images go out too.** `Ctrl+V` in the message box attaches whatever image
+  is on the clipboard — screenshot, then paste — and a file dropped onto the
+  conversation attaches that. Deliberately no file dialog: this desktop ships
+  none (no zenity, no kdialog), and the two gestures above are how images
+  actually get sent. What is staged shows as a chip above the message box
+  with a ✕, so nothing can be sent unseen. An attachment can carry a comment
+  or go on its own.
+- New `slack.sh upload <channel> <path> [thread_ts]` (comment on stdin) runs
+  Slack's three-step external upload, and `clip-image` writes the clipboard's
+  image to a private file. The signed upload URL is checked to be on
+  `slack.com` before any bytes go to it, and the token is never sent there —
+  the URL is itself the credential. The file travels on curl's stdin rather
+  than inside a `-F` value, where `;` and `,` have meaning a dropped path
+  could smuggle in.
+- `files:write` joins the requested scopes and the `docs/OWN-APP.md` manifest.
+
 - **Images arrive.** `conversations.history` returns a `files` array that the
   plugin threw away, so a message whose only content was a screenshot showed
   as blank. Attachments now ride along, and images render inline in the

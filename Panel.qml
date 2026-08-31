@@ -1801,18 +1801,6 @@ Item {
                   font.pixelSize: Style.font.caption
                   horizontalAlignment: Text.AlignHCenter
                 }
-
-                Text {
-                  textFormat: Text.PlainText
-                  visible: !!(root.counts && root.counts.capped)
-                  width: convColumn.width
-                  topPadding: Style.space(6)
-                  text: "unreads checked for the 30 most relevant conversations"
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Math.max(8, Style.font.caption - 1)
-                  wrapMode: Text.WordWrap
-                }
               }
             }
           }

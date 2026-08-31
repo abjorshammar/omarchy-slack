@@ -132,6 +132,15 @@ re-polls once a minute. Unread counts use different (roomier) API methods and
 poll every 3 minutes by default (`omarchy bar set bottelet.slack
 refreshMinutes N`), fetching all your workspaces in parallel.
 
+There is no bulk unread endpoint for a user token, so each conversation costs
+one request and only 30 of them fit in a cycle. Rather than always checking
+the same 30, the plugin spends that budget on whatever has been active in the
+last 90 minutes and fills the rest with whatever it has gone longest without
+checking — so a busy conversation refreshes every cycle and the whole list
+still rotates through in a few. A conversation not checked this cycle keeps
+the count it was last seen with instead of reporting zero. Set
+`MAX_CONV_INFO` or `HOT_SECONDS` in the environment to retune it.
+
 ## Privacy & security
 
 - Your Slack password is only ever typed on Slack's own pages.

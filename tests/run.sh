@@ -464,6 +464,53 @@ cached="$(run counts-cached)"
 check "counts-cached without a cache is not ok" "$(jq -r '.ok' <<<"$cached")" "false"
 check "counts-cached without a cache says so" "$(jq -r '.error' <<<"$cached")" "no cache"
 mv "$WORK/counts.bak" "$CACHE/counts.json"
+
+# Adaptive polling. Slack prices conversations.info per conversation, so only
+# MAX_CONV_INFO of them fit in a cycle. Squeezed to one slot, the three Acme
+# conversations must rotate through rather than the same one winning forever,
+# and the two left out must keep the unread they were last seen with.
+echo "== adaptive polling"
+STATE="$CACHE/$ACME/convstate.json"
+rm -f "$STATE"
+first="$(MAX_CONV_INFO=1 run counts)"
+check "one slot leaves the rest uncounted" "$(jq -r '.capped' <<<"$first")" "true"
+check "the polled conversation has its unread" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .unread' <<<"$first")" "3"
+check "state remembers just the one polled" "$(jq -r 'length' "$STATE")" "1"
+check "state remembers its unread" "$(jq -r '.D0AAAAAA1.unread' "$STATE")" "3"
+
+second="$(MAX_CONV_INFO=1 run counts)"
+check "the next cycle polls a different one" "$(jq -r 'length' "$STATE")" "2"
+check "rotation reached the channel" "$(jq -r 'has("C0BBBBBB2")' "$STATE")" "true"
+# The whole point of remembering: an unread must not blink off just because
+# this cycle's budget went elsewhere.
+check "skipped conversation keeps its unread" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .unread' <<<"$second")" "3"
+check "skipped conversation keeps its ts" "$(jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .latest' <<<"$second")" "1755900000.000100"
+
+MAX_CONV_INFO=1 run counts >/dev/null
+check "three cycles cover all three conversations" "$(jq -r 'length' "$STATE")" "3"
+
+# Activity within HOT_SECONDS jumps the queue. C0BBBBBB2 is the worst pick by
+# the sweep's rule here — it was polled after D0AAAAAA1 — so a fresh count for
+# it can only mean the hot tier chose it. A planted unread of 99 tells the two
+# outcomes apart without consulting a clock: 1 is the live figure, 99 the
+# remembered one.
+plant() { # plant <hot|cold>
+  jq -c --argjson now "$(date +%s)" --arg mode "$1" \
+    '.C0BBBBBB2.unread = 99
+     | .C0BBBBBB2.latest = (if $mode == "hot" then (($now|tostring) + ".000000") else "1755900001.000100" end)' \
+    "$STATE" > "$STATE.t" && mv "$STATE.t" "$STATE"
+}
+plant hot
+out="$(MAX_CONV_INFO=1 run counts)"
+check "a hot conversation is polled ahead of the sweep" "$(jq -r '.conversations[] | select(.id=="C0BBBBBB2") | .unread' <<<"$out")" "1"
+# ...and it does not starve the sweep once it goes quiet again.
+plant cold
+out="$(MAX_CONV_INFO=1 run counts)"
+check "a cooled conversation yields its slot" "$(jq -r '.conversations[] | select(.id=="C0BBBBBB2") | .unread' <<<"$out")" "99"
+
+check "a junk budget falls back to the default" "$(MAX_CONV_INFO='; rm -rf /' run counts | jq -r '.capped')" "false"
+# Back to a clean slate: every later check assumes the full budget.
+rm -f "$STATE" "$CACHE/$BETA/convstate.json"
 # A workspace whose token has gone away still gets a tile, tagged and errored.
 mv "$CFG/tokens/$BETA" "$WORK/beta.tok"
 out="$(run counts-all)"

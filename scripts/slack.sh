@@ -35,6 +35,7 @@ MAX_CONV_INFO=30           # conversations.info calls per counts cycle
 MAX_USER_LOOKUPS=20        # users.info calls per cycle
 MAX_MSG_CHARS=4000         # chat.postMessage text cap (Slack's own limit)
 MAX_WORKSPACES=8           # workspaces polled by counts-all
+PARALLEL_MAX=4             # concurrent transfers in a batched curl (rate-safe)
 HISTORY_CACHE_SECS=60      # non-Marketplace apps: conversations.history is 1 req/min
 
 TOKEN_RE='^xox[pb]-[A-Za-z0-9-]{10,200}$'
@@ -559,56 +560,99 @@ valid_avatar() { [[ "$1" =~ ^https://(secure\.gravatar\.com|[a-z0-9.-]*\.slack-e
 # avatar (https-pinned, size-capped) and convert it to a small local PNG that
 # Qt renders natively; cache per user id, under this workspace's cache dir.
 # Echoes the local PNG path, or nothing on failure.
-cache_avatar() {
-  local uid="$1" url="$2" out="$AVATAR_DIR/$uid.png" tmp
-  [[ "$uid" =~ ^[UW][A-Z0-9]{5,30}$ ]] || return 1
-  [[ -s "$out" ]] && { printf '%s' "$out"; return 0; }
-  valid_avatar "$url" || return 1
-  command -v magick >/dev/null 2>&1 || return 1
-  mkdir -p "$AVATAR_DIR" 2>/dev/null || return 1
-  tmp="$(mktemp "$out.XXXXXX")" || return 1
-  if ! "${CURL[@]}" --max-time 10 "$url" -o "$tmp.src" 2>/dev/null; then
-    rm -f "$tmp" "$tmp.src" 2>/dev/null; return 1
-  fi
-  # Only feed known raster formats to ImageMagick — never SVG/MVG/MSL, which
-  # can trigger delegates/SSRF/file reads. (Belt with the CDN allowlist above.)
-  local mime
-  mime="$(file -b --mime-type "$tmp.src" 2>/dev/null || echo "")"
-  case "$mime" in
-    image/png|image/jpeg|image/gif|image/webp|image/bmp) : ;;
-    *) rm -f "$tmp" "$tmp.src" 2>/dev/null; return 1 ;;
-  esac
-  # Force JPEG output (this Qt build decodes jpeg via libqjpeg) regardless of
-  # source format; resource limits guard against decompression bombs; [0]
-  # reads only the first frame.
-  if magick -limit memory 64MiB -limit disk 128MiB \
-       "$tmp.src[0]" -resize 72x72^ -gravity center -extent 72x72 "jpg:$tmp" 2>/dev/null; then
-    mv "$tmp" "$out"; rm -f "$tmp.src"; printf '%s' "$out"; return 0
-  fi
-  rm -f "$tmp" "$tmp.src" 2>/dev/null; return 1
-}
+# batch_users_info <json-array-of-user-ids> — parallel users.info, returns
+# {uid: {name, img}}: name resolved with the display→real→username fallback and
+# 80-capped, img the best avatar URL or "".
+batch_users_info() {
+  local ids="$1" n
+  n="$(jq 'length' <<<"$ids" 2>/dev/null || echo 0)"
+  (( n == 0 )) && { echo '{}'; return 0; }
 
-# resolve_users <json array of user ids> — fetches at most MAX_USER_LOOKUPS
-# unknown ids, merges into the cache, prints the full cache object.
-resolve_users() {
-  local ids="$1" cache missing uid info name img local_av fetched=0
-  cache="$(load_users_cache)"
-  missing="$(jq -cr --argjson cache "$cache" '[.[] | select($cache[.] == null)] | unique | .[]' <<<"$ids" 2>/dev/null)"
+  local outdir
+  outdir="$(mktemp -d "$TEAM_CACHE/.usr.XXXXXX")" || { echo '{}'; return 1; }
+  # uids are [UW][A-Z0-9]+ so safe unencoded in the query string.
   while IFS= read -r uid; do
     [[ -z "$uid" ]] && continue
     valid_user "$uid" || continue
-    (( fetched >= MAX_USER_LOOKUPS )) && break
-    fetched=$((fetched + 1))
-    info="$(api_call users.info -G --data-urlencode "user=$uid")" || continue
-    name="$(jq -r '.user.profile.display_name // "" | select(. != "")' <<<"$info" 2>/dev/null)"
-    [[ -z "$name" ]] && name="$(jq -r '.user.real_name // .user.name // ""' <<<"$info" 2>/dev/null)"
-    [[ -z "$name" ]] && continue
-    name="${name:0:80}"
-    img="$(jq -r '.user.profile.image_72 // .user.profile.image_48 // ""' <<<"$info" 2>/dev/null)"
-    local_av="$(cache_avatar "$uid" "$img")" || local_av=""
-    cache="$(jq -c --arg id "$uid" --arg n "$name" --arg i "$local_av" '.[$id] = {n:$n, i:$i}' <<<"$cache")"
-  done <<<"$missing"
-  # Bound the cache: 80-char names above, 400 entries here.
+    printf '%s\t%s\n' "$API/users.info?user=$uid" "$outdir/$uid.json"
+  done < <(jq -r '.[]' <<<"$ids" 2>/dev/null) | run_batch 1
+
+  local result
+  result="$(cat "$outdir"/*.json 2>/dev/null | jq -sc '
+    reduce .[] as $r ({};
+      if ($r.ok == true and ($r.user.id // "") != "")
+      then .[$r.user.id] = {
+             name: (((($r.user.profile.display_name // "") | select(. != ""))
+                     // $r.user.real_name // $r.user.name // "") | .[0:80]),
+             img: ($r.user.profile.image_72 // $r.user.profile.image_48 // "")}
+      else . end)' 2>/dev/null || echo '{}')"
+  rm -rf "$outdir"
+  printf '%s' "${result:-\{\}}"
+}
+
+# batch_cache_avatars <json-object {uid: url}> — download the valid, not-yet-
+# cached avatars in ONE parallel curl, then convert each to a local PNG. Same
+# raster-only guard as before (never feed SVG/MVG to ImageMagick). Best-effort;
+# a failed download or convert just leaves that user without a local avatar.
+# Avatars live on public CDN hosts (allowlisted per url), so no auth header.
+batch_cache_avatars() {
+  local map="$1"
+  command -v magick >/dev/null 2>&1 || return 0
+  mkdir -p "$AVATAR_DIR" 2>/dev/null || return 0
+  local dldir
+  dldir="$(mktemp -d "$AVATAR_DIR/.dl.XXXXXX")" || return 0
+
+  # Avatars are public CDN objects (host allowlisted per url) — no auth header.
+  while IFS=$'\t' read -r uid url; do
+    [[ -z "$uid" || -z "$url" ]] && continue
+    [[ "$uid" =~ ^[UW][A-Z0-9]{5,30}$ ]] || continue
+    [[ -s "$AVATAR_DIR/$uid.png" ]] && continue
+    valid_avatar "$url" || continue
+    printf '%s\t%s\n' "$url" "$dldir/$uid.src"
+  done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<<"$map" 2>/dev/null) | run_batch 0
+
+  local src u mime
+  for src in "$dldir"/*.src; do
+    [[ -e "$src" ]] || continue
+    u="$(basename "$src" .src)"
+    mime="$(file -b --mime-type "$src" 2>/dev/null || echo "")"
+    case "$mime" in
+      image/png|image/jpeg|image/gif|image/webp|image/bmp) : ;;
+      *) rm -f "$src"; continue ;;
+    esac
+    # Force jpeg output (this Qt build decodes jpeg via libqjpeg); resource
+    # limits guard against decompression bombs; [0] reads only the first frame.
+    magick -limit memory 64MiB -limit disk 128MiB \
+      "$src[0]" -resize 72x72^ -gravity center -extent 72x72 "jpg:$AVATAR_DIR/$u.png" 2>/dev/null
+    rm -f "$src"
+  done
+  rm -rf "$dldir"
+}
+
+# resolve_users <json array of user ids> — fetches at most MAX_USER_LOOKUPS
+# unknown ids in one parallel batch (with their avatars in another), merges
+# into the cache, prints the full cache object.
+resolve_users() {
+  local ids="$1" cache missing info_map have
+  cache="$(load_users_cache)"
+  missing="$(jq -c --argjson cache "$cache" --argjson cap "$MAX_USER_LOOKUPS" '
+    [ .[] | select($cache[.] == null) ] | unique
+    | map(select(test("^[UW][A-Z0-9]{5,30}$"))) | .[0:$cap]' <<<"$ids" 2>/dev/null || echo '[]')"
+
+  if [[ "$(jq 'length' <<<"$missing" 2>/dev/null || echo 0)" -gt 0 ]]; then
+    info_map="$(batch_users_info "$missing")"
+    batch_cache_avatars "$(jq -c 'with_entries(select(.value.img != "")) | with_entries(.value = .value.img)' <<<"$info_map")"
+    # Which uids ended up with a real PNG on disk — so `i` is never a path to a
+    # file that isn't there (the QML side would try to load it and fail).
+    have="$( { cd "$AVATAR_DIR" 2>/dev/null && ls -1 ./*.png 2>/dev/null | sed 's#^\./##; s#\.png$##'; } \
+             | jq -R . | jq -sc 'map(select(length > 0))' 2>/dev/null || echo '[]')"
+    cache="$(jq -c --argjson info "$info_map" --argjson have "$have" --arg dir "$AVATAR_DIR" '
+      ($have | map({key: ., value: true}) | from_entries) as $h
+      | reduce ($info | to_entries[] | select(.value.name != "")) as $e (.;
+          .[$e.key] = { n: $e.value.name,
+                        i: (if $h[$e.key] then ($dir + "/" + $e.key + ".png") else "" end) })' <<<"$cache")"
+  fi
+  # Bound the cache at 400 entries.
   cache="$(jq -c 'to_entries | .[-400:] | from_entries' <<<"$cache")"
   write_atomic "$USERS_CACHE" "$cache"
   printf '%s' "$cache"
@@ -624,6 +668,60 @@ load_seen() {
     printf '{}' > "$SEEN_FILE" 2>/dev/null || true
     echo '{}'
   fi
+}
+
+# run_batch <with_auth 0|1> — read TAB-separated "url<TAB>outfile" lines on
+# stdin and fetch them all in ONE parallel curl. Everything (including the bearer
+# token, when with_auth=1) travels in a curl config piped on stdin via `-K -`,
+# so — exactly like the single-call process-substitution path — the token never
+# touches argv and never lands in a file on disk. The same https-pin, size and
+# time caps as elsewhere are set as global config options.
+run_batch() {
+  local with_auth="$1"
+  {
+    printf 'parallel\nparallel-max = %s\nproto = "=https"\nproto-redir = "=https"\nmax-filesize = %s\nmax-time = 20\nsilent\nshow-error\n' \
+      "$PARALLEL_MAX" "$MAX_BYTES"
+    (( with_auth )) && printf 'header = "Authorization: Bearer %s"\n' "$TOKEN"
+    local url out
+    while IFS=$'\t' read -r url out; do
+      [[ -z "$url" || -z "$out" ]] && continue
+      # A double-quote or newline would break the config line; no legitimate
+      # URL here contains one (ids are validated, avatar hosts allowlisted).
+      case "$url" in *'"'*|*$'\n'*) continue ;; esac
+      printf 'url = "%s"\noutput = "%s"\n' "$url" "$out"
+    done
+  } | curl -K - 2>/dev/null
+}
+
+# batch_conversations_info <json-array-of-channel-ids> — fetch conversations.info
+# for every id in ONE parallel curl instead of one process per id, and return a
+# single JSON object mapping channel id -> {unread, latest}. Each id is
+# regex-validated before it can become a request or a filename. Empty -> "{}".
+batch_conversations_info() {
+  local ids="$1" n
+  n="$(jq 'length' <<<"$ids" 2>/dev/null || echo 0)"
+  (( n == 0 )) && { echo '{}'; return 0; }
+
+  local outdir
+  outdir="$(mktemp -d "$TEAM_CACHE/.info.XXXXXX")" || { echo '{}'; return 1; }
+  # ids are [CDGW][A-Z0-9]+ so safe unencoded in the query string.
+  while IFS= read -r id; do
+    [[ -z "$id" ]] && continue
+    valid_channel "$id" || continue
+    printf '%s\t%s\n' "$API/conversations.info?channel=$id" "$outdir/$id.json"
+  done < <(jq -r '.[]' <<<"$ids" 2>/dev/null) | run_batch 1
+
+  # Assemble every response in ONE jq pass (no per-id accumulator).
+  local result
+  result="$(cat "$outdir"/*.json 2>/dev/null | jq -sc '
+    reduce .[] as $r ({};
+      if ($r.ok == true and ($r.channel.id // "") != "")
+      then .[$r.channel.id] = {
+             unread: ($r.channel.unread_count_display // $r.channel.unread_count // 0),
+             latest: ($r.channel.latest.ts // "")}
+      else . end)' 2>/dev/null || echo '{}')"
+  rm -rf "$outdir"
+  printf '%s' "${result:-\{\}}"
 }
 
 # counts_payload <types> — one workspace's conversations and unread counts.
@@ -658,24 +756,23 @@ counts_payload() {
       user: (.user // "")
     }]' <<<"$convs")"
 
-  # Unread counts: one conversations.info per row, capped. DMs first — their
-  # unreads are what the bar badge counts, so they must land inside the cap.
-  local ordered enriched="[]" row id info detail count=0
-  ordered="$(jq -c '[.[] | select(.kind == "im" or .kind == "mpim")] + [.[] | select(.kind != "im" and .kind != "mpim")]' <<<"$base")"
-  while IFS= read -r row; do
-    [[ -z "$row" ]] && continue
-    id="$(jq -r '.id' <<<"$row")"
-    valid_channel "$id" || continue
-    if (( count < MAX_CONV_INFO )); then
-      count=$((count + 1))
-      info="$(api_call conversations.info -G --data-urlencode "channel=$id")" || info='{}'
-      detail="$(jq -c '{unread: (.channel.unread_count_display // .channel.unread_count // 0),
-                        latest: (.channel.latest.ts // "")}' <<<"$info" 2>/dev/null || echo '{"unread":0,"latest":""}')"
-    else
-      detail='{"unread":0,"latest":"","uncounted":true}'
-    fi
-    enriched="$(jq -c --argjson row "$row" --argjson d "$detail" '. + [$row + $d]' <<<"$enriched")"
-  done <<<"$(jq -c '.[]' <<<"$ordered")"
+  # Unread counts: DMs first (their unreads are what the bar badge counts, so
+  # they must land inside the cap), rows with a valid channel id only. The
+  # first MAX_CONV_INFO are priced in one parallel conversations.info batch;
+  # the rest ride along marked uncounted. Same output as the old per-row loop,
+  # without one process per conversation.
+  local ordered enriched details to_fetch
+  ordered="$(jq -c '
+    [.[] | select(.id | test("^[CDGW][A-Z0-9]{5,30}$"))]
+    | [.[] | select(.kind == "im" or .kind == "mpim")]
+      + [.[] | select(.kind != "im" and .kind != "mpim")]' <<<"$base")"
+  to_fetch="$(jq -c --argjson cap "$MAX_CONV_INFO" '[.[range(0; ([length, $cap] | min))].id]' <<<"$ordered")"
+  details="$(batch_conversations_info "$to_fetch")"
+  enriched="$(jq -c --argjson d "$details" --argjson cap "$MAX_CONV_INFO" '
+    [ range(0; length) as $i | .[$i] as $row
+      | if $i < $cap
+        then $row + ($d[$row.id] // {unread: 0, latest: ""})
+        else $row + {unread: 0, latest: "", uncounted: true} end ]' <<<"$ordered")"
 
   # Resolve DM counterpart names through this workspace's user cache.
   local dm_ids users

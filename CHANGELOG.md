@@ -42,6 +42,17 @@
 - Fixed: `Esc` inside a conversation called `backToList()`, which was never
   defined, so it threw instead of returning to the conversation list.
 
+## Unreleased
+
+- Much faster unread polling. The per-conversation `conversations.info` and
+  per-user `users.info` fan-outs, previously one `curl` (and several `jq`)
+  per item, are now issued as parallel batches (`curl -Z`, capped at 4
+  concurrent — rate-safe), and each batch's responses are assembled in a
+  single `jq` pass instead of an accumulator rebuilt per item. Avatar
+  downloads are batched the same way. A warm counts cycle drops from ~9s to
+  ~2s; a cold open (empty caches) from ~15s to under 4s, with ~10× fewer
+  processes spawned. Output is byte-for-byte unchanged.
+
 ## 1.0.0
 
 Initial release.

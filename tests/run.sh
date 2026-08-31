@@ -235,6 +235,30 @@ cat > "$XDG_CONFIG_HOME/omarchy-slack/oauth.json" <<'EOF'
 EOF
 out="$(run login-available)"
 check "invalid override leaves login unavailable" "$(jq -r '.available' <<<"$out")" "false"
+
+# Read-state sync needs write scopes on every conversation type. They are
+# heavier than the rest, so the browser flow asks for them only on opt-in —
+# matching the scope set the paste-a-token path gets from OWN-APP.md.
+WRITE_SCOPES="channels:write groups:write im:write mpim:write"
+cat > "$XDG_CONFIG_HOME/omarchy-slack/oauth.json" <<'EOF'
+{"client_id":"111.222","proxy_url":"https://my-own.example.workers.dev"}
+EOF
+check "sync off by default" "$(run login-available | jq -r '.sync_read_state')" "false"
+scopes="$(run login-available | jq -r '.scopes')"
+for w in $WRITE_SCOPES; do
+  case ",$scopes," in *,$w,*) fail "default flow requests $w" ;; *) ok "default flow omits $w" ;; esac
+done
+case ",$scopes," in *,im:history,*) ok "default flow still requests im:history" ;; *) fail "default flow lost im:history" ;; esac
+
+cat > "$XDG_CONFIG_HOME/omarchy-slack/oauth.json" <<'EOF'
+{"client_id":"111.222","proxy_url":"https://my-own.example.workers.dev","sync_read_state":true}
+EOF
+check "sync opt-in is reported" "$(run login-available | jq -r '.sync_read_state')" "true"
+scopes="$(run login-available | jq -r '.scopes')"
+for w in $WRITE_SCOPES; do
+  case ",$scopes," in *,$w,*) ok "opt-in flow requests $w" ;; *) fail "opt-in flow missing $w" ;; esac
+done
+case ",$scopes," in *,users:read,*) ok "opt-in flow keeps the base scopes" ;; *) fail "opt-in flow dropped base scopes" ;; esac
 rm -f "$XDG_CONFIG_HOME/omarchy-slack/oauth.json"
 
 # Token file symlink resistance: a planted symlink must be neither read

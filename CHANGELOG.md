@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Browser sign-in can request the read-state-sync write scopes by opting in
+  with `"sync_read_state": true` in `oauth.json`; `login-available` reports the
+  exact scope list it will ask for.
+
 - Fixed: a conversation whose newest message is a *threaded* reply could never
   be marked read. `conversations.history` returns only top-level messages, so
   the read marker stopped short of the conversation head and the unread badge

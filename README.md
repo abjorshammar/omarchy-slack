@@ -85,6 +85,27 @@ extra write scopes (`channels:write`, `groups:write`, `im:write`,
 default; without them Slack keeps its own read state and the plugin quietly
 skips the sync.
 
+**Paste-a-token** already includes them: the `docs/OWN-APP.md` manifest asks
+for all four.
+
+**Browser sign-in** omits them unless you opt in, because the consent screen
+should not ask for write access nobody wanted. To turn it on, add
+`"sync_read_state": true` to `~/.config/omarchy-slack/oauth.json`:
+
+```json
+{
+  "client_id": "…",
+  "proxy_url": "https://…workers.dev",
+  "sync_read_state": true
+}
+```
+
+Your Slack app must also declare those four scopes under **OAuth &
+Permissions → User Token Scopes**, or Slack rejects the authorize request with
+`invalid_scope`. Scopes are fixed at authorization, so a token issued earlier
+keeps the scopes it was granted — sign out and back in to pick up the new
+ones. `slack.sh login-available` prints the exact scope list it will request.
+
 ## Rate limits, honestly
 
 Slack gives personal (non-Marketplace) apps created after May 2025 one

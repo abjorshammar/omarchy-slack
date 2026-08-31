@@ -133,6 +133,23 @@ oauth_config() {
 
 OAUTH_SCOPES="channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,chat:write,users:read,dnd:read,dnd:write,users:write"
 
+# Marking a conversation read on your phone and in the official clients needs
+# write access to each conversation type. They are heavier permissions than
+# anything else here, so the browser flow asks for them only when the user
+# opts in with "sync_read_state": true in oauth.json — the same scopes the
+# paste-a-token path gets from the docs/OWN-APP.md manifest. The Slack app
+# must declare them under User Token Scopes too, or Slack rejects the
+# authorize request with invalid_scope.
+OAUTH_SCOPES_WRITE="channels:write,groups:write,im:write,mpim:write"
+
+oauth_scopes() {
+  if [[ "$(jq -r '.sync_read_state // false' <<<"$1" 2>/dev/null)" == "true" ]]; then
+    printf '%s,%s' "$OAUTH_SCOPES" "$OAUTH_SCOPES_WRITE"
+  else
+    printf '%s' "$OAUTH_SCOPES"
+  fi
+}
+
 cmd_login() {
   local cfg cid proxy port
   cfg="$(oauth_config)" || emit_error "not configured"
@@ -152,9 +169,10 @@ cmd_login() {
 
   # The redirect_uri is the proxy's /callback; the proxy does the secret-bearing
   # token exchange and 302s the token to our loopback listener.
-  local redirect auth_url
+  local redirect auth_url scopes
+  scopes="$(oauth_scopes "$cfg")"
   redirect="$proxy/callback"
-  auth_url="https://slack.com/oauth/v2/authorize?client_id=$cid&user_scope=$(jq -rn --arg s "$OAUTH_SCOPES" '$s|@uri')&state=$(jq -rn --arg s "$state" '$s|@uri')&redirect_uri=$(jq -rn --arg u "$redirect" '$u|@uri')"
+  auth_url="https://slack.com/oauth/v2/authorize?client_id=$cid&user_scope=$(jq -rn --arg s "$scopes" '$s|@uri')&state=$(jq -rn --arg s "$state" '$s|@uri')&redirect_uri=$(jq -rn --arg u "$redirect" '$u|@uri')"
 
   # Listener binds first (no race), then opens the browser. In proxy mode it
   # waits for ?token=…&state=<nonce> and prints the token, nothing else.
@@ -181,8 +199,16 @@ cmd_login() {
 
 # Whether browser sign-in is available (client id + proxy url configured).
 cmd_login_available() {
-  if oauth_config >/dev/null; then jq -cn '{ok:true, available:true}'
-  else jq -cn '{ok:true, available:false}'; fi
+  local cfg
+  if cfg="$(oauth_config)"; then
+    # Report the exact scope list the browser flow will ask for, so what the
+    # consent screen shows is inspectable before anyone clicks it.
+    jq -cn --argjson sync "$(jq -c '.sync_read_state // false' <<<"$cfg")" \
+           --arg scopes "$(oauth_scopes "$cfg")" \
+      '{ok:true, available:true, sync_read_state:$sync, scopes:$scopes}'
+  else
+    jq -cn --arg scopes "$OAUTH_SCOPES" '{ok:true, available:false, sync_read_state:false, scopes:$scopes}'
+  fi
 }
 
 # ------------------------------------------------------------------ API layer

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Browser sign-in can request the read-state-sync write scopes by opting in
+  with `"sync_read_state": true` in `oauth.json`; `login-available` reports the
+  exact scope list it will ask for.
+
 ## 1.0.0
 
 Initial release.

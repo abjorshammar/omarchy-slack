@@ -17,13 +17,30 @@ BarWidget {
   property var counts: null
 
   // Live read markers: the full app writes seen.json as you read; applying
-  // it here clears the badge without waiting for the next poll.
+  // it here clears the badge without waiting for the next poll. One file
+  // covers every workspace (keys are "<team>/<channel>"), so this stays a
+  // single watcher.
   property var seenMap: ({})
 
-  readonly property var conversations: Model.sortConversations(
-    Model.applyLocalRead(counts ? counts.conversations : [], seenMap))
-  readonly property int mentionCount: Model.mentionCount(conversations)
-  readonly property int unreadChannels: Model.unreadChannelCount(conversations)
+  // The badge is the whole point of signing in to more than one workspace:
+  // it counts unread DMs everywhere, so a message in a workspace you are not
+  // currently looking at still reaches you.
+  readonly property var workspaces: Model.workspaceSummaries(
+    counts ? { workspaces: counts.workspaces, seen: seenMap } : null)
+  readonly property int mentionCount: Model.totalMentions(workspaces)
+  readonly property int unreadChannels: Model.totalUnreadChannels(workspaces)
+
+  // Which workspaces the waiting DMs are in, when there is more than one.
+  readonly property string mentionBreakdown: {
+    if (workspaces.length < 2) return ""
+    var parts = []
+    for (var i = 0; i < workspaces.length; i++) {
+      var w = workspaces[i]
+      if (w.mentions > 0) parts.push(w.team + " " + w.mentions)
+      else if (!w.ok) parts.push(w.team + " — " + w.error)
+    }
+    return parts.join("  ·  ")
+  }
 
   function refresh() {
     if (!statusProc.running) statusProc.running = true
@@ -31,7 +48,9 @@ BarWidget {
 
   function applyStatus(raw) {
     var data = Model.parseJson(raw)
-    hasToken = !!(data.ok && data.has_token && data.valid)
+    // A workspace whose token has gone bad is reported per workspace by
+    // counts-all, so poll as long as any workspace is signed in at all.
+    hasToken = !!(data.ok && data.has_token)
     if (hasToken && !countsProc.running) countsProc.running = true
   }
 
@@ -63,7 +82,7 @@ BarWidget {
 
   Process {
     id: countsProc
-    command: Model.countsCommand(root.scriptDir, true)
+    command: Model.countsAllCommand(root.scriptDir, true)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyCounts(text)
@@ -98,7 +117,7 @@ BarWidget {
     active: root.mentionCount > 0 || root.unreadChannels > 0
     useActiveColor: true
     activeColor: root.mentionCount > 0 ? Color.urgent : Color.accent
-    tooltipText: root.hasToken ? "" : "Slack — click to sign in"
+    tooltipText: root.hasToken ? root.mentionBreakdown : "Slack — click to sign in"
 
     onPressed: function(b) {
       if (b === Qt.MiddleButton) root.refresh()

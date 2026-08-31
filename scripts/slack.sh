@@ -6,16 +6,27 @@
 # GNOME Keyring (secret-tool) when available, else from a 0600 file, and is
 # only ever handed to curl through a process-substitution header file so it
 # never appears on any process's argv.
+#
+# Multi-workspace: tokens, caches and API calls are namespaced by Slack team
+# id. Every command takes an optional leading `--team <T…>`; without it the
+# command acts on the active workspace recorded in the registry
+# (~/.config/omarchy-slack/workspaces.json), which holds no secrets.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-slack"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-slack"
-TOKEN_FILE="$CONFIG_DIR/token"
-USERS_CACHE="$CACHE_DIR/users-v2.json"   # v2: values are {n,i}, i is a local PNG path
-SEEN_FILE="$CACHE_DIR/seen.json"
-AVATAR_DIR="$CACHE_DIR/avatars"
+LEGACY_TOKEN_FILE="$CONFIG_DIR/token"     # pre-multi-workspace single token
+TOKENS_DIR="$CONFIG_DIR/tokens"           # one 0600 file per team id
+REGISTRY="$CONFIG_DIR/workspaces.json"    # metadata only — never a token
+SEEN_FILE="$CACHE_DIR/seen.json"          # global; keys are "<team>/<channel>"
 API="https://slack.com/api"
+
+# Per-team state, filled in by set_team_paths.
+TEAM_ID=""
+TEAM_CACHE=""
+USERS_CACHE=""    # v2: values are {n,i}, i is a local PNG path
+AVATAR_DIR=""
 
 # Bounds. Slack method responses are small; the caps exist so a hostile or
 # misbehaving endpoint cannot stream without end into the shell process.
@@ -23,7 +34,10 @@ MAX_BYTES=4194304          # 4 MiB per response
 MAX_CONV_INFO=30           # conversations.info calls per counts cycle
 MAX_USER_LOOKUPS=20        # users.info calls per cycle
 MAX_MSG_CHARS=4000         # chat.postMessage text cap (Slack's own limit)
+MAX_WORKSPACES=8           # workspaces polled by counts-all
 HISTORY_CACHE_SECS=60      # non-Marketplace apps: conversations.history is 1 req/min
+
+TOKEN_RE='^xox[pb]-[A-Za-z0-9-]{10,200}$'
 
 CURL=(curl -sS --proto '=https' --proto-redir '=https' --max-filesize "$MAX_BYTES")
 
@@ -36,20 +50,127 @@ umask 077
 mkdir -p "$CACHE_DIR" || emit_error "cannot create cache dir"
 chmod 700 "$CACHE_DIR" 2>/dev/null || true
 
+# write_atomic <path> <content> — mktemp (0600 under our umask) then rename, so
+# a planted symlink at the destination is replaced rather than written through.
+write_atomic() {
+  local dest="$1" content="$2" tmp
+  tmp="$(mktemp "$dest.XXXXXX")" || return 1
+  printf '%s' "$content" > "$tmp" && mv -f "$tmp" "$dest"
+}
+
+# ------------------------------------------------------------ id validation
+
+# Team ids become a path component and a keyring attribute, so they are
+# validated before any filesystem or secret-store use. [TE]: workspaces are
+# T…, Enterprise Grid orgs are E….
+valid_team() { [[ "$1" =~ ^[TE][A-Z0-9]{2,30}$ ]]; }
+valid_channel() { [[ "$1" =~ ^[CDGW][A-Z0-9]{5,30}$ ]]; }
+valid_user() { [[ "$1" =~ ^[UW][A-Z0-9]{5,30}$ ]]; }
+valid_ts() { [[ "$1" =~ ^[0-9]{1,12}\.[0-9]{1,8}$ ]]; }
+
+# set_team_paths <team_id> — point the per-workspace caches at that team.
+set_team_paths() {
+  valid_team "$1" || return 1
+  TEAM_ID="$1"
+  TEAM_CACHE="$CACHE_DIR/$TEAM_ID"
+  USERS_CACHE="$TEAM_CACHE/users-v2.json"
+  AVATAR_DIR="$TEAM_CACHE/avatars"
+  mkdir -p "$TEAM_CACHE" 2>/dev/null || return 1
+  chmod 700 "$TEAM_CACHE" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------ registry
+
+# The registry is display metadata only — team name, your name, poll flag —
+# so the UI can draw the workspace rail without a network call or a keyring
+# unlock. Tokens never appear here.
+registry_read() {
+  if [[ -s "$REGISTRY" ]]; then
+    jq -c 'if type == "object" then
+             {active: (.active // ""),
+              workspaces: [(.workspaces // [])[] | select(type == "object" and (.team_id // "") != "")]}
+           else {active:"", workspaces:[]} end' "$REGISTRY" 2>/dev/null \
+      || echo '{"active":"","workspaces":[]}'
+  else
+    echo '{"active":"","workspaces":[]}'
+  fi
+}
+
+registry_write() {
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || return 1
+  chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+  write_atomic "$REGISTRY" "$1"
+}
+
+# registry_upsert <team_id> <team> <user> <user_id> <url> — add or refresh a
+# workspace in place, preserving list order (the rail's order) and any
+# existing poll flag.
+registry_upsert() {
+  local reg
+  reg="$(registry_read)"
+  # Names come from Slack and are display data only (every Text rendering them
+  # is PlainText, tooltips included) — bounded here the same way user display
+  # names are in resolve_users.
+  reg="$(jq -c --arg t "$1" --arg team "$2" --arg u "$3" --arg uid "$4" --arg url "$5" '
+    ($team | .[0:80]) as $team | ($u | .[0:80]) as $u |
+    .workspaces = (if (.workspaces | map(.team_id) | index($t)) != null
+      then (.workspaces | map(if .team_id == $t
+             then . + {team:$team, user:$u, user_id:$uid, url:$url} else . end))
+      else (.workspaces + [{team_id:$t, team:$team, user:$u, user_id:$uid, url:$url, poll:true}])
+      end)
+    | .active = (if (.active // "") == "" then $t else .active end)' <<<"$reg")" || return 1
+  registry_write "$reg"
+}
+
+registry_set_active() {
+  local reg
+  reg="$(registry_read)"
+  reg="$(jq -c --arg t "$1" '.active = $t' <<<"$reg")" || return 1
+  registry_write "$reg"
+}
+
+# registry_remove <team_id> — drop a workspace and hand `active` to whatever
+# is left, so the UI is never pointed at a workspace that no longer exists.
+registry_remove() {
+  local reg
+  reg="$(registry_read)"
+  reg="$(jq -c --arg t "$1" '
+    .workspaces = [.workspaces[] | select(.team_id != $t)]
+    | .active = (if .active == $t then (.workspaces[0].team_id // "") else .active end)' <<<"$reg")" || return 1
+  registry_write "$reg"
+}
+
+# The workspace commands act on when no --team is given: the recorded active
+# one, else the first registered.
+active_team() {
+  local reg a
+  reg="$(registry_read)"
+  a="$(jq -r '.active // ""' <<<"$reg")"
+  if [[ -n "$a" ]] && valid_team "$a"; then printf '%s' "$a"; return 0; fi
+  a="$(jq -r '.workspaces[0].team_id // ""' <<<"$reg")"
+  if [[ -n "$a" ]] && valid_team "$a"; then printf '%s' "$a"; return 0; fi
+  return 1
+}
+
 # ---------------------------------------------------------------- token store
 
 have_keyring() { command -v secret-tool >/dev/null 2>&1; }
 
-read_token() {
-  local t=""
-  if have_keyring; then
-    t="$(timeout 3 secret-tool lookup service omarchy-slack key token 2>/dev/null || true)"
-  fi
-  if [[ -z "$t" && -e "$TOKEN_FILE" ]]; then
-    # Descriptor-bound no-follow read: a planted symlink or irregular file at
-    # the token path is refused outright instead of trusted via a pathname
-    # check that races. python3 is already a dependency (oauth-callback.py).
-    t="$(python3 - "$TOKEN_FILE" <<'PY' 2>/dev/null | tr -d '[:space:]'
+# libsecret matches on an attribute SUBSET: `secret-tool clear service
+# omarchy-slack key token` also deletes an item that additionally carries
+# team=…. So per-workspace tokens use a DIFFERENT key value rather than the
+# legacy `token` plus an extra attribute — attribute values must match
+# exactly, which makes the two namespaces genuinely disjoint. Without this,
+# migration's cleanup of the legacy entry wiped the token it had just
+# written, and the removal command in older docs would wipe every workspace.
+KEYRING_KEY="ws-token"          # per-workspace items
+KEYRING_KEY_LEGACY="token"      # the single pre-multi-workspace item
+
+# Descriptor-bound no-follow read: a planted symlink or irregular file at the
+# token path is refused outright instead of trusted via a pathname check that
+# races. python3 is already a dependency (oauth-callback.py).
+read_token_file() {
+  python3 - "$1" <<'PY' 2>/dev/null | tr -d '[:space:]'
 import os, stat, sys
 try:
     fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -60,38 +181,175 @@ if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
     sys.exit(1)
 sys.stdout.write(os.read(fd, 512).decode("utf-8", "replace"))
 PY
-)"
+}
+
+# read_token <team_id> — keyring first (keyed by team), else the 0600 file.
+read_token() {
+  local team="$1" t=""
+  valid_team "$team" || return 1
+  if have_keyring; then
+    t="$(timeout 3 secret-tool lookup service omarchy-slack key "$KEYRING_KEY" team "$team" 2>/dev/null || true)"
   fi
-  [[ "$t" =~ ^xox[pb]-[A-Za-z0-9-]{10,200}$ ]] || return 1
+  if [[ -z "$t" && -e "$TOKENS_DIR/$team" ]]; then
+    t="$(read_token_file "$TOKENS_DIR/$team")"
+  fi
+  [[ "$t" =~ $TOKEN_RE ]] || return 1
   printf '%s' "$t"
 }
 
-# store_raw_token <token> — keyring first, 0600 file otherwise. Sets STORED.
+# store_raw_token <team_id> <token> — keyring first, 0600 file otherwise.
+# Sets STORED. Returns non-zero if the token could not be persisted at all.
 store_raw_token() {
-  local t="$1"
-  if have_keyring && printf '%s' "$t" | timeout 3 secret-tool store --label="Omarchy Slack token" service omarchy-slack key token 2>/dev/null; then
+  local team="$1" t="$2"
+  valid_team "$team" || return 1
+  if have_keyring && printf '%s' "$t" \
+    | timeout 3 secret-tool store --label="Omarchy Slack token ($team)" service omarchy-slack key "$KEYRING_KEY" team "$team" 2>/dev/null; then
     STORED="keyring"
-    rm -f "$TOKEN_FILE" 2>/dev/null
-  else
-    # Write to a fresh temp file, then rename over the destination: rename()
-    # replaces even a planted symlink with the regular file instead of
-    # following it, and the swap is atomic.
-    (
-      umask 077
-      mkdir -p "$CONFIG_DIR" || exit 1
-      tmp="$(mktemp "$CONFIG_DIR/.token.XXXXXX")" || exit 1
-      printf '%s\n' "$t" > "$tmp" || { rm -f "$tmp"; exit 1; }
-      mv -f "$tmp" "$TOKEN_FILE"
-    ) || emit_error "could not write token file"
-    STORED="file"
+    rm -f "$TOKENS_DIR/$team" 2>/dev/null
+    return 0
   fi
+  (
+    umask 077
+    mkdir -p "$TOKENS_DIR" || exit 1
+    chmod 700 "$TOKENS_DIR" 2>/dev/null || true
+    tmp="$(mktemp "$TOKENS_DIR/.token.XXXXXX")" || exit 1
+    printf '%s\n' "$t" > "$tmp" || { rm -f "$tmp"; exit 1; }
+    mv -f "$tmp" "$TOKENS_DIR/$team"
+  ) || return 1
+  STORED="file"
 }
 
-# confirm_token — auth.test with $TOKEN and emit the standard confirmation.
-confirm_token() {
-  local res
+# forget_token <team_id> — remove the secret and every trace of that workspace.
+forget_token() {
+  local team="$1"
+  valid_team "$team" || return 1
+  if have_keyring; then
+    timeout 3 secret-tool clear service omarchy-slack key "$KEYRING_KEY" team "$team" 2>/dev/null || true
+  fi
+  rm -f "$TOKENS_DIR/$team" 2>/dev/null
+  rm -rf "${CACHE_DIR:?}/$team" 2>/dev/null
+  # Drop that workspace's read markers from the shared seen map.
+  if [[ -s "$SEEN_FILE" ]]; then
+    local s
+    s="$(jq -c --arg t "$team" 'if type == "object"
+           then with_entries(select(.key | startswith($t + "/") | not)) else {} end' "$SEEN_FILE" 2>/dev/null)"
+    [[ -n "$s" ]] && write_atomic "$SEEN_FILE" "$s"
+  fi
+  registry_remove "$team"
+}
+
+# ------------------------------------------------------------------ migration
+
+# One-time move from the pre-multi-workspace layout: a single token at a
+# team-less keyring key or ~/.config/omarchy-slack/token, with caches sitting
+# directly in the cache dir. The team id comes from auth.test, which status
+# already had to call — so this costs no extra request.
+migrate_legacy() {
+  [[ -s "$REGISTRY" ]] && return 0
+  local t=""
+  if have_keyring; then
+    t="$(timeout 3 secret-tool lookup service omarchy-slack key "$KEYRING_KEY_LEGACY" 2>/dev/null || true)"
+  fi
+  if [[ -z "$t" && -e "$LEGACY_TOKEN_FILE" ]]; then
+    t="$(read_token_file "$LEGACY_TOKEN_FILE")"
+  fi
+  t="${t//[$'\t\r\n ']/}"
+  [[ "$t" =~ $TOKEN_RE ]] || return 1
+
+  local res tid
+  TOKEN="$t"
+  res="$(api_call auth.test -X POST)" || return 1
+  jq -e '.ok == true' <<<"$res" >/dev/null 2>&1 || return 1
+  tid="$(jq -r '.team_id // ""' <<<"$res")"
+  valid_team "$tid" || return 1
+
+  store_raw_token "$tid" "$t" || return 1
+  # Only drop the old copy once the new one reads back — never leave the user
+  # with no token because a keyring write silently failed.
+  read_token "$tid" >/dev/null || return 1
+
+  registry_upsert "$tid" \
+    "$(jq -r '.team // ""' <<<"$res")" \
+    "$(jq -r '.user // ""' <<<"$res")" \
+    "$(jq -r '.user_id // ""' <<<"$res")" \
+    "$(jq -r '.url // ""' <<<"$res")"
+  registry_set_active "$tid"
+  migrate_legacy_cache "$tid"
+
+  # Safe now only because the per-workspace items use a different key value:
+  # this clear cannot reach the one just written.
+  if have_keyring; then
+    timeout 3 secret-tool clear service omarchy-slack key "$KEYRING_KEY_LEGACY" 2>/dev/null || true
+  fi
+  rm -f "$LEGACY_TOKEN_FILE" 2>/dev/null
+  return 0
+}
+
+# Caches that used to live directly under the cache dir move under the team,
+# and seen.json's bare channel ids become "<team>/<channel>".
+migrate_legacy_cache() {
+  local tid="$1" f
+  mkdir -p "$CACHE_DIR/$tid" 2>/dev/null || return 1
+  chmod 700 "$CACHE_DIR/$tid" 2>/dev/null || true
+  for f in users-v2.json avatars; do
+    [[ -e "$CACHE_DIR/$f" ]] && mv "$CACHE_DIR/$f" "$CACHE_DIR/$tid/$f" 2>/dev/null
+  done
+  for f in "$CACHE_DIR"/hist-*.json "$CACHE_DIR"/thread-*.json; do
+    [[ -e "$f" ]] && mv "$f" "$CACHE_DIR/$tid/" 2>/dev/null
+  done
+  # The user cache stores each avatar as an ABSOLUTE path, so moving the file
+  # is not enough — those paths still point at the pre-migration location.
+  # resolve_users only fetches ids it does not already know, so a stale entry
+  # never heals itself: without this every already-cached user would lose
+  # their avatar permanently.
+  if [[ -s "$CACHE_DIR/$tid/users-v2.json" ]]; then
+    local u
+    u="$(jq -c --arg old "$CACHE_DIR/avatars/" --arg new "$CACHE_DIR/$tid/avatars/" '
+      if type == "object" then
+        with_entries(.value |= (if type == "object" and ((.i // "") | startswith($old))
+          then .i = ($new + (.i | .[($old | length):]))
+          else . end))
+      else {} end' "$CACHE_DIR/$tid/users-v2.json" 2>/dev/null)"
+    [[ -n "$u" ]] && write_atomic "$CACHE_DIR/$tid/users-v2.json" "$u"
+  fi
+  if [[ -s "$SEEN_FILE" ]]; then
+    local s
+    s="$(jq -c --arg t "$tid" 'if type == "object"
+           then with_entries(if (.key | test("/")) then . else .key = ($t + "/" + .key) end)
+           else {} end' "$SEEN_FILE" 2>/dev/null)"
+    [[ -n "$s" ]] && write_atomic "$SEEN_FILE" "$s"
+  fi
+  return 0
+}
+
+# ------------------------------------------------------- sign-in confirmation
+
+# verify_and_store <token> — identify the workspace the token belongs to, then
+# store it under that team and register it. A token is never persisted before
+# Slack tells us whose it is, so it can always be attributed to a workspace.
+verify_and_store() {
+  local t="$1" res tid
+  TOKEN="$t"
   res="$(api_call auth.test -X POST)" || emit_error "network error talking to slack.com"
-  jq -c --arg s "$STORED" '{ok:.ok, error:(.error // ""), stored:$s, team:(.team // ""), user:(.user // ""), user_id:(.user_id // ""), url:(.url // "")}' <<<"$res" 2>/dev/null \
+  jq -e '.ok == true' <<<"$res" >/dev/null 2>&1 || {
+    jq -c '{ok:false, error:(.error // "auth failed")}' <<<"$res" 2>/dev/null || emit_error "auth failed"
+    exit 0
+  }
+  tid="$(jq -r '.team_id // ""' <<<"$res")"
+  valid_team "$tid" || emit_error "slack did not identify the workspace"
+
+  store_raw_token "$tid" "$t" || emit_error "could not save the token"
+  set_team_paths "$tid" || emit_error "could not create the workspace cache"
+  registry_upsert "$tid" \
+    "$(jq -r '.team // ""' <<<"$res")" \
+    "$(jq -r '.user // ""' <<<"$res")" \
+    "$(jq -r '.user_id // ""' <<<"$res")" \
+    "$(jq -r '.url // ""' <<<"$res")"
+  registry_set_active "$tid"
+
+  jq -c --arg s "$STORED" --argjson n "$(registry_read | jq -c '.workspaces | length')" \
+    '{ok:true, error:"", stored:$s, team:(.team // ""), team_id:(.team_id // ""),
+      user:(.user // ""), user_id:(.user_id // ""), url:(.url // ""), workspaces:$n}' <<<"$res" 2>/dev/null \
     || emit_error "unexpected reply from slack.com"
   exit 0
 }
@@ -100,17 +358,59 @@ store_token() { # token on stdin
   local t
   IFS= read -r t || true
   t="${t//[$'\t\r\n ']/}"
-  [[ "$t" =~ ^xox[pb]-[A-Za-z0-9-]{10,200}$ ]] || emit_error "that does not look like a Slack token (expected xoxp-… or xoxb-…)"
-  store_raw_token "$t"
-  TOKEN="$t"
-  confirm_token
+  [[ "$t" =~ $TOKEN_RE ]] || emit_error "that does not look like a Slack token (expected xoxp-… or xoxb-…)"
+  verify_and_store "$t"
 }
 
+# clear-token [--all | --team <id>] — forget the selected workspace (default:
+# the active one), or every workspace at once. `--team` is accepted here as
+# well as before the subcommand, since that is how the command reads.
 clear_token() {
-  if have_keyring; then timeout 3 secret-tool clear service omarchy-slack key token 2>/dev/null || true; fi
-  rm -f "$TOKEN_FILE" 2>/dev/null
-  rm -rf "$CACHE_DIR" 2>/dev/null
-  jq -cn '{ok:true}'
+  local all=false
+  while (( $# )); do
+    case "$1" in
+      --all)    all=true; shift ;;
+      --team)   TEAM_ID="${2:-}"; shift 2 2>/dev/null || shift
+                valid_team "$TEAM_ID" || emit_error "bad workspace id" ;;
+      --team=*) TEAM_ID="${1#--team=}"; shift
+                valid_team "$TEAM_ID" || emit_error "bad workspace id" ;;
+      *)        shift ;;
+    esac
+  done
+
+  if [[ "$all" == true ]]; then
+    local reg tid
+    reg="$(registry_read)"
+    while IFS= read -r tid; do
+      [[ -n "$tid" ]] && valid_team "$tid" && forget_token "$tid"
+    done <<<"$(jq -r '.workspaces[].team_id' <<<"$reg")"
+    # Sweep both namespaces, so a workspace missing from the registry does not
+    # leave an orphaned secret behind.
+    if have_keyring; then
+      timeout 3 secret-tool clear service omarchy-slack key "$KEYRING_KEY" 2>/dev/null || true
+      timeout 3 secret-tool clear service omarchy-slack key "$KEYRING_KEY_LEGACY" 2>/dev/null || true
+    fi
+    rm -f "$LEGACY_TOKEN_FILE" 2>/dev/null
+    rm -rf "$CACHE_DIR" 2>/dev/null
+    rm -rf "$TOKENS_DIR" 2>/dev/null
+    rm -f "$REGISTRY" 2>/dev/null
+    jq -cn '{ok:true, workspaces:0}'
+    exit 0
+  fi
+
+  local tid="${TEAM_ID:-}"
+  [[ -z "$tid" ]] && tid="$(active_team || true)"
+  if [[ -z "$tid" ]]; then
+    # Nothing registered: still clear a stale pre-multi-workspace token.
+    if have_keyring; then timeout 3 secret-tool clear service omarchy-slack key "$KEYRING_KEY_LEGACY" 2>/dev/null || true; fi
+    rm -f "$LEGACY_TOKEN_FILE" 2>/dev/null
+    rm -rf "$CACHE_DIR" 2>/dev/null
+    jq -cn '{ok:true, workspaces:0}'
+    exit 0
+  fi
+  forget_token "$tid" || emit_error "could not remove that workspace"
+  jq -cn --argjson n "$(registry_read | jq -c '.workspaces | length')" \
+         --arg a "$(active_team || true)" '{ok:true, workspaces:$n, active:$a}'
   exit 0
 }
 
@@ -150,6 +450,8 @@ oauth_scopes() {
   fi
 }
 
+# Browser sign-in doubles as "add a workspace": you pick the workspace on
+# Slack's own consent page, and the token comes back tagged with its team.
 cmd_login() {
   local cfg cid proxy port
   cfg="$(oauth_config)" || emit_error "not configured"
@@ -192,9 +494,7 @@ cmd_login() {
     emit_error "sign-in timed out or was cancelled"
   fi
   [[ "$token" =~ ^xoxp-[A-Za-z0-9-]{10,200}$ ]] || emit_error "sign-in did not return a valid token"
-  store_raw_token "$token"
-  TOKEN="$token"
-  confirm_token
+  verify_and_store "$token"
 }
 
 # Whether browser sign-in is available (client id + proxy url configured).
@@ -224,19 +524,22 @@ api_call() {
     "$@" "$API/$method" | head -c "$MAX_BYTES"
 }
 
+# Resolve the workspace this invocation acts on (--team, else active) and load
+# its token and caches.
 require_token() {
-  TOKEN="$(read_token)" || emit_error "no token"
+  local tid="${TEAM_ID:-}"
+  [[ -z "$tid" ]] && tid="$(active_team || true)"
+  [[ -n "$tid" ]] || emit_error "no token"
+  valid_team "$tid" || emit_error "bad workspace id"
+  TOKEN="$(read_token "$tid")" || emit_error "no token"
+  set_team_paths "$tid" || emit_error "cannot create cache dir"
 }
-
-valid_channel() { [[ "$1" =~ ^[CDGW][A-Z0-9]{5,30}$ ]]; }
-valid_user() { [[ "$1" =~ ^[UW][A-Z0-9]{5,30}$ ]]; }
-valid_ts() { [[ "$1" =~ ^[0-9]{1,12}\.[0-9]{1,8}$ ]]; }
 
 # ----------------------------------------------------------------- user names
 
-# users.json cache: { "U123": "Display Name", ... }. Names are display data
-# only; the QML side renders them PlainText.
-# Cache shape: { "U123": {"n":"Display Name","i":"https://…/image_48"}, … }.
+# Per-workspace cache: user ids are only unique within a workspace, so a
+# shared map would show the wrong name (and face) on a DM.
+# Cache shape: { "U123": {"n":"Display Name","i":"/…/avatars/U123.png"}, … }.
 # Old caches stored a bare name string per id; normalize those to {n:…} on read.
 load_users_cache() {
   if [[ -s "$USERS_CACHE" ]]; then
@@ -254,8 +557,8 @@ valid_avatar() { [[ "$1" =~ ^https://(secure\.gravatar\.com|[a-z0-9.-]*\.slack-e
 
 # Slack serves avatars as .webp, which Qt here can't decode. Download the
 # avatar (https-pinned, size-capped) and convert it to a small local PNG that
-# Qt renders natively; cache per user id. Echoes the local PNG path, or
-# nothing on failure. Only ever fetches from validated Slack hosts.
+# Qt renders natively; cache per user id, under this workspace's cache dir.
+# Echoes the local PNG path, or nothing on failure.
 cache_avatar() {
   local uid="$1" url="$2" out="$AVATAR_DIR/$uid.png" tmp
   [[ "$uid" =~ ^[UW][A-Z0-9]{5,30}$ ]] || return 1
@@ -307,16 +610,27 @@ resolve_users() {
   done <<<"$missing"
   # Bound the cache: 80-char names above, 400 entries here.
   cache="$(jq -c 'to_entries | .[-400:] | from_entries' <<<"$cache")"
-  local tmp
-  tmp="$(mktemp "$USERS_CACHE.XXXXXX")" && printf '%s' "$cache" > "$tmp" && mv "$tmp" "$USERS_CACHE"
+  write_atomic "$USERS_CACHE" "$cache"
   printf '%s' "$cache"
 }
 
 # --------------------------------------------------------------------- counts
 
-cmd_counts() {
-  require_token
-  local types="${1:-im,mpim,public_channel,private_channel}"
+# The shared read-marker map, keyed "<team>/<channel>".
+load_seen() {
+  if [[ -s "$SEEN_FILE" ]]; then
+    jq -c 'if type == "object" then . else {} end' "$SEEN_FILE" 2>/dev/null || echo '{}'
+  else
+    printf '{}' > "$SEEN_FILE" 2>/dev/null || true
+    echo '{}'
+  fi
+}
+
+# counts_payload <types> — one workspace's conversations and unread counts.
+# Assumes TOKEN and the per-team paths are already set. Prints the workspace
+# object without the (global) seen map.
+counts_payload() {
+  local types="$1"
   [[ "$types" =~ ^[a-z_,]+$ ]] || emit_error "bad types"
 
   local me convs
@@ -363,7 +677,7 @@ cmd_counts() {
     enriched="$(jq -c --argjson row "$row" --argjson d "$detail" '. + [$row + $d]' <<<"$enriched")"
   done <<<"$(jq -c '.[]' <<<"$ordered")"
 
-  # Resolve DM counterpart names through the user cache.
+  # Resolve DM counterpart names through this workspace's user cache.
   local dm_ids users
   dm_ids="$(jq -c '[.[] | select(.kind == "im") | .user | select(. != "")]' <<<"$enriched")"
   users="$(resolve_users "$dm_ids")"
@@ -373,33 +687,127 @@ cmd_counts() {
   presence="$(api_call users.getPresence -G 2>/dev/null || echo '{}')"
   dnd="$(api_call dnd.info -G 2>/dev/null || echo '{}')"
 
-  # Local read markers ride along so the UI can compute effective unreads;
-  # creating the file here also makes it watchable from QML from day one.
-  local seen
-  if [[ -s "$SEEN_FILE" ]]; then
-    seen="$(jq -c 'if type == "object" then . else {} end' "$SEEN_FILE" 2>/dev/null || echo '{}')"
-  else
-    seen='{}'
-    printf '%s' "$seen" > "$SEEN_FILE" 2>/dev/null || true
-  fi
-
+  # Every conversation carries `key` — "<team>/<channel>" — the identity the
+  # shared seen map and the QML side use, so the convention lives in one place.
   jq -cn \
+    --arg team_id "$TEAM_ID" \
     --argjson me "$(jq -c '{team:(.team // ""), team_id:(.team_id // ""), user:(.user // ""), user_id:(.user_id // ""), url:(.url // "")}' <<<"$me")" \
     --argjson rows "$enriched" \
     --argjson users "$users" \
     --argjson presence "$(jq -c '{presence:(.presence // "")}' <<<"$presence" 2>/dev/null || echo '{"presence":""}')" \
     --argjson dnd "$(jq -c '{snoozing:(.snooze_enabled // false), snooze_until:(.snooze_endtime // 0)}' <<<"$dnd" 2>/dev/null || echo '{"snoozing":false,"snooze_until":0}')" \
-    --argjson seen "$seen" \
-    '{ok:true, team:$me.team, team_id:$me.team_id, self:$me.user, self_id:$me.user_id, url:$me.url, seen:$seen,
+    '{ok:true, team:$me.team, team_id:(if $me.team_id != "" then $me.team_id else $team_id end),
+      self:$me.user, self_id:$me.user_id, url:$me.url,
       presence:$presence.presence, snoozing:$dnd.snoozing, snooze_until:$dnd.snooze_until,
       capped: ([$rows[] | select(.uncounted == true)] | length > 0),
       conversations: [$rows[] | {
         id, kind, latest,
+        key: ($team_id + "/" + .id),
         unread: (.unread // 0),
         name: (if .kind == "im" then (($users[.user].n) // .user) else .name end),
         avatar: (if .kind == "im" then (($users[.user].i) // "") else "" end),
         user: (.user // "")
       }]}'
+}
+
+cmd_counts() {
+  require_token
+  local out
+  out="$(counts_payload "${1:-im,mpim,public_channel,private_channel}")"
+  jq -c --argjson seen "$(load_seen)" '. + {seen:$seen}' <<<"$out" 2>/dev/null \
+    || printf '%s\n' "$out"
+}
+
+# counts_one <team_id> <types> — one workspace, in isolation, always tagged
+# with its team id (and name, where the registry knows it) even on failure, so
+# a workspace that is rate limited or signed out still gets a rail tile.
+counts_one() {
+  local tid="$1" types="$2" name out
+  name="$(registry_read | jq -r --arg t "$tid" '.workspaces[] | select(.team_id == $t) | .team // ""' 2>/dev/null)"
+  out="$(
+    set_team_paths "$tid" || { jq -cn '{ok:false,error:"cannot create cache dir"}'; exit 0; }
+    TOKEN="$(read_token "$tid")" || { jq -cn '{ok:false,error:"no token"}'; exit 0; }
+    counts_payload "$types"
+  )"
+  jq -c --arg t "$tid" --arg n "$name" \
+    '. + {team_id: (if (.team_id // "") != "" then .team_id else $t end),
+          team: (if (.team // "") != "" then .team else $n end)}' <<<"$out" 2>/dev/null \
+    || jq -cn --arg t "$tid" --arg n "$name" '{ok:false, team_id:$t, team:$n, error:"unexpected reply"}'
+}
+
+# counts-all — every polled workspace in one payload, fetched in parallel.
+# The bar badge and the workspace rail both read this, so neither has to fan
+# out into one process per workspace.
+cmd_counts_all() {
+  migrate_legacy || true
+  local types="${1:-im,mpim,public_channel,private_channel}"
+  [[ "$types" =~ ^[a-z_,]+$ ]] || emit_error "bad types"
+
+  local reg order tmpd tid n=0
+  reg="$(registry_read)"
+  order="$(jq -c '[.workspaces[].team_id]' <<<"$reg")"
+  tmpd="$(mktemp -d "$CACHE_DIR/.counts.XXXXXX")" || emit_error "cannot create cache dir"
+  # Killed mid-poll, the per-workspace scratch files would otherwise pile up
+  # in the cache dir with conversation metadata in them.
+  trap 'rm -rf "$tmpd" 2>/dev/null' EXIT TERM INT
+
+  local pids=()
+  while IFS= read -r tid; do
+    [[ -z "$tid" ]] && continue
+    valid_team "$tid" || continue
+    (( n >= MAX_WORKSPACES )) && break
+    n=$((n + 1))
+    counts_one "$tid" "$types" > "$tmpd/$tid.json" 2>/dev/null &
+    pids+=("$!")
+  done <<<"$(jq -r '.workspaces[] | select(.poll != false) | .team_id' <<<"$reg")"
+  local p
+  for p in ${pids[@]+"${pids[@]}"}; do wait "$p" 2>/dev/null; done
+
+  local ws="[]"
+  if compgen -G "$tmpd/*.json" >/dev/null 2>&1; then
+    ws="$(cat "$tmpd"/*.json 2>/dev/null \
+      | jq -sc --argjson order "$order" 'sort_by(. as $w | ($order | index($w.team_id)) // 999)' 2>/dev/null)" \
+      || ws="[]"
+    [[ -n "$ws" ]] || ws="[]"
+  fi
+  rm -rf "$tmpd" 2>/dev/null
+  trap - EXIT TERM INT
+
+  # `registered` counts every workspace in the registry, polled or not, so the
+  # UI can tell "one workspace" from "one being polled" without guessing.
+  jq -cn --argjson ws "$ws" --argjson seen "$(load_seen)" \
+         --argjson registered "$(jq -c '.workspaces | length' <<<"$reg")" \
+         --arg active "$(active_team || true)" \
+    '{ok:true, active:$active, registered:$registered, seen:$seen, workspaces:$ws}'
+}
+
+# workspaces — the registry, plus whether each still has a usable token. No
+# network: this is what the UI draws the workspace rail from.
+cmd_workspaces() {
+  migrate_legacy || true
+  local reg out="[]" tid row
+  reg="$(registry_read)"
+  while IFS= read -r row; do
+    [[ -z "$row" ]] && continue
+    tid="$(jq -r '.team_id // ""' <<<"$row")"
+    valid_team "$tid" || continue
+    local has=false
+    read_token "$tid" >/dev/null 2>&1 && has=true
+    out="$(jq -c --argjson r "$row" --argjson h "$has" '. + [$r + {has_token:$h}]' <<<"$out")"
+  done <<<"$(jq -c '.workspaces[]' <<<"$reg")"
+  jq -cn --argjson ws "$out" --arg a "$(active_team || true)" \
+    '{ok:true, active:$a, workspaces:$ws}'
+}
+
+# use <team_id> — make a workspace the one commands act on by default, and
+# remember it across restarts.
+cmd_use() {
+  local tid="${1:-}"
+  valid_team "$tid" || emit_error "bad workspace id"
+  registry_read | jq -e --arg t "$tid" '[.workspaces[].team_id] | index($t) != null' >/dev/null 2>&1 \
+    || emit_error "not signed in to that workspace"
+  registry_set_active "$tid" || emit_error "could not save the active workspace"
+  jq -cn --arg a "$tid" '{ok:true, active:$a}'
 }
 
 # -------------------------------------------------------------------- history
@@ -411,7 +819,8 @@ cmd_history() {
 
   # Non-Marketplace Slack apps created after May 2025 get 1 history request
   # per minute (15 messages). Serve a fresh-enough cache instead of burning it.
-  local cache_file="$CACHE_DIR/hist-$id.json" now age
+  # The budget is per app-per-workspace, so each workspace caches separately.
+  local cache_file="$TEAM_CACHE/hist-$id.json" now age
   now="$(date +%s)"
   if [[ -s "$cache_file" ]]; then
     age=$(( now - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0) ))
@@ -434,7 +843,7 @@ cmd_history() {
     emit_error "$err"
   fi
 
-  local msgs uids users out tmp
+  local msgs uids users out
   # reply_count>0 marks a thread parent; thread_ts is the parent's ts. Only
   # top-level messages are kept here (replies are shown via `thread`).
   msgs="$(jq -c '[.messages[]? | select(.type == "message")
@@ -445,10 +854,11 @@ cmd_history() {
        text: ((.text // "") | .[0:8000])}] | reverse' <<<"$res")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
   users="$(resolve_users "$uids")"
-  # channel rides along so the UI can drop a payload that arrives after the
-  # user has already switched conversations.
-  out="$(jq -cn --arg ch "$id" --argjson m "$msgs" --argjson u "$users" '{ok:true, channel:$ch, messages:$m, users:$u}')"
-  tmp="$(mktemp "$cache_file.XXXXXX")" && printf '%s' "$out" > "$tmp" && mv "$tmp" "$cache_file"
+  # team and channel ride along so the UI can drop a payload that arrives
+  # after the user has already switched workspace or conversation.
+  out="$(jq -cn --arg t "$TEAM_ID" --arg ch "$id" --argjson m "$msgs" --argjson u "$users" \
+    '{ok:true, team_id:$t, channel:$ch, messages:$m, users:$u}')"
+  write_atomic "$cache_file" "$out"
   printf '%s\n' "$out"
 }
 
@@ -463,7 +873,7 @@ cmd_thread() {
   valid_channel "$id" || emit_error "bad channel id"
   valid_ts "$ts" || emit_error "bad ts"
 
-  local cache_file="$CACHE_DIR/thread-$id-$ts.json" now age
+  local cache_file="$TEAM_CACHE/thread-$id-$ts.json" now age
   now="$(date +%s)"
   if [[ -s "$cache_file" ]]; then
     age=$(( now - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0) ))
@@ -486,7 +896,7 @@ cmd_thread() {
     emit_error "$err"
   fi
 
-  local msgs uids users out tmp
+  local msgs uids users out
   # conversations.replies returns the parent first then replies, oldest→newest.
   msgs="$(jq -c '[.messages[]? | select(.type == "message")
     | {ts: (.ts // ""), user: (.user // ""), bot: (.bot_id // ""),
@@ -496,9 +906,9 @@ cmd_thread() {
        text: ((.text // "") | .[0:8000])}]' <<<"$res")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
   users="$(resolve_users "$uids")"
-  out="$(jq -cn --arg ch "$id" --arg ts "$ts" --argjson m "$msgs" --argjson u "$users" \
-    '{ok:true, channel:$ch, thread_ts:$ts, messages:$m, users:$u}')"
-  tmp="$(mktemp "$cache_file.XXXXXX")" && printf '%s' "$out" > "$tmp" && mv "$tmp" "$cache_file"
+  out="$(jq -cn --arg t "$TEAM_ID" --arg ch "$id" --arg ts "$ts" --argjson m "$msgs" --argjson u "$users" \
+    '{ok:true, team_id:$t, channel:$ch, thread_ts:$ts, messages:$m, users:$u}')"
+  write_atomic "$cache_file" "$out"
   printf '%s\n' "$out"
 }
 
@@ -526,11 +936,12 @@ cmd_send() {
   res="$(printf '%s' "$body_base" \
     | api_call chat.postMessage -X POST -H 'Content-Type: application/json; charset=utf-8' --data-binary @-)" \
     || emit_error "network error sending message"
-  jq -c '{ok:.ok, error:(.error // ""), ts:(.ts // "")}' <<<"$res" 2>/dev/null || emit_error "unexpected reply"
+  jq -c --arg t "$TEAM_ID" '{ok:.ok, error:(.error // ""), ts:(.ts // ""), team_id:$t}' <<<"$res" 2>/dev/null \
+    || emit_error "unexpected reply"
   # A successful send makes the cached history/thread stale immediately.
   if jq -e '.ok == true' <<<"$res" >/dev/null 2>&1; then
-    rm -f "$CACHE_DIR/hist-$id.json"
-    [[ -n "$thread_ts" ]] && rm -f "$CACHE_DIR/thread-$id-$thread_ts.json"
+    rm -f "$TEAM_CACHE/hist-$id.json"
+    [[ -n "$thread_ts" ]] && rm -f "$TEAM_CACHE/thread-$id-$thread_ts.json"
   fi
   exit 0
 }
@@ -546,18 +957,15 @@ cmd_seen() {
   valid_channel "$id" || emit_error "bad channel id"
   valid_ts "$ts" || emit_error "bad ts"
 
-  local seen
-  if [[ -s "$SEEN_FILE" ]]; then
-    seen="$(jq -c 'if type == "object" then . else {} end' "$SEEN_FILE" 2>/dev/null || echo '{}')"
-  else
-    seen='{}'
-  fi
-  # Keep the newest marker per conversation; bound the map at 300 entries.
-  seen="$(jq -c --arg id "$id" --arg ts "$ts" \
+  # One map across all workspaces, keyed "<team>/<channel>" so the bar widget
+  # keeps watching a single file.
+  local seen key="$TEAM_ID/$id"
+  seen="$(load_seen)"
+  # Keep the newest marker per conversation; bound the map at 500 entries.
+  seen="$(jq -c --arg id "$key" --arg ts "$ts" \
     '.[$id] = (if (.[$id] // "0" | tonumber) > ($ts | tonumber) then .[$id] else $ts end)
-     | to_entries | sort_by(.value | tonumber) | .[-300:] | from_entries' <<<"$seen")"
-  local tmp
-  tmp="$(mktemp "$SEEN_FILE.XXXXXX")" && printf '%s' "$seen" > "$tmp" && mv "$tmp" "$SEEN_FILE"
+     | to_entries | sort_by(.value | tonumber) | .[-500:] | from_entries' <<<"$seen")"
+  write_atomic "$SEEN_FILE" "$seen"
 
   local res marked=false
   res="$(jq -cn --arg ch "$id" --arg ts "$ts" '{channel:$ch, ts:$ts}' \
@@ -565,7 +973,7 @@ cmd_seen() {
         -H 'Content-Type: application/json; charset=utf-8' \
         --data-binary @- 2>/dev/null || echo '{}')"
   jq -e '.ok == true' <<<"$res" >/dev/null 2>&1 && marked=true
-  jq -cn --argjson m "$marked" '{ok:true, marked:$m}'
+  jq -cn --argjson m "$marked" --arg k "$key" '{ok:true, marked:$m, key:$k}'
 }
 
 cmd_presence() {
@@ -595,24 +1003,50 @@ cmd_unsnooze() {
 
 cmd_status() {
   # First command every widget runs — make seen.json exist so QML file
-  # watchers have something to watch from the start.
+  # watchers have something to watch from the start, and fold a
+  # pre-multi-workspace token into the registry.
   [[ -s "$SEEN_FILE" ]] || printf '{}' > "$SEEN_FILE" 2>/dev/null || true
-  local t
-  if ! t="$(read_token)"; then
-    jq -cn '{ok:true, has_token:false}'
+  migrate_legacy || true
+
+  local count tid t
+  count="$(registry_read | jq -c '.workspaces | length')"
+  tid="${TEAM_ID:-}"
+  [[ -z "$tid" ]] && tid="$(active_team || true)"
+  if [[ -z "$tid" ]] || ! t="$(read_token "$tid")"; then
+    jq -cn --argjson n "$count" '{ok:true, has_token:false, workspaces:$n}'
     exit 0
   fi
   TOKEN="$t"
   local res
-  res="$(api_call auth.test -X POST)" || { jq -cn '{ok:true, has_token:true, valid:false, error:"network"}'; exit 0; }
-  jq -c '{ok:true, has_token:true, valid:(.ok == true), error:(.error // ""), team:(.team // ""), user:(.user // "")}' <<<"$res" 2>/dev/null \
-    || jq -cn '{ok:true, has_token:true, valid:false, error:"unexpected reply"}'
+  res="$(api_call auth.test -X POST)" \
+    || { jq -cn --argjson n "$count" --arg t "$tid" '{ok:true, has_token:true, valid:false, error:"network", team_id:$t, workspaces:$n}'; exit 0; }
+  jq -c --argjson n "$count" --arg t "$tid" \
+    '{ok:true, has_token:true, valid:(.ok == true), error:(.error // ""),
+      team:(.team // ""), team_id:(if (.team_id // "") != "" then .team_id else $t end),
+      user:(.user // ""), workspaces:$n}' <<<"$res" 2>/dev/null \
+    || jq -cn --argjson n "$count" '{ok:true, has_token:true, valid:false, error:"unexpected reply", workspaces:$n}'
 }
 
 # --------------------------------------------------------------------- router
 
+# An optional leading `--team <T…>` selects the workspace for any command.
+# Without it, commands act on the active workspace from the registry — which
+# is what keeps every pre-multi-workspace call site working unchanged.
+while [[ "${1:-}" == --team || "${1:-}" == --team=* ]]; do
+  if [[ "${1:-}" == --team=* ]]; then
+    TEAM_ID="${1#--team=}"; shift
+  else
+    TEAM_ID="${2:-}"; shift 2 2>/dev/null || shift
+  fi
+  [[ -n "$TEAM_ID" ]] || emit_error "bad workspace id"
+  valid_team "$TEAM_ID" || emit_error "bad workspace id"
+done
+
 case "${1:-}" in
   counts)          shift; cmd_counts "$@" ;;
+  counts-all)      shift; cmd_counts_all "$@" ;;
+  workspaces)      cmd_workspaces ;;
+  use)             shift; cmd_use "$@" ;;
   history)         shift; cmd_history "$@" ;;
   thread)          shift; cmd_thread "$@" ;;
   send)            shift; cmd_send "$@" ;;
@@ -624,6 +1058,6 @@ case "${1:-}" in
   login)           cmd_login ;;
   login-available) cmd_login_available ;;
   set-token)       store_token ;;
-  clear-token)     clear_token ;;
+  clear-token)     shift; clear_token "$@" ;;
   *)               emit_error "unknown command" ;;
 esac

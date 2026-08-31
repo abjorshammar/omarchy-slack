@@ -657,8 +657,13 @@ resolve_users() {
     batch_cache_avatars "$(jq -c 'with_entries(select(.value.img != "")) | with_entries(.value = .value.img)' <<<"$info_map")"
     # Which uids ended up with a real PNG on disk — so `i` is never a path to a
     # file that isn't there (the QML side would try to load it and fail).
-    have="$( { cd "$AVATAR_DIR" 2>/dev/null && ls -1 ./*.png 2>/dev/null | sed 's#^\./##; s#\.png$##'; } \
-             | jq -R . | jq -sc 'map(select(length > 0))' 2>/dev/null || echo '[]')"
+    # `find` is used rather than a glob because it still exits 0 when the
+    # directory is empty: under `pipefail` a failing glob made the pipeline
+    # fail *after* jq had already printed, so the `|| echo` fallback appended
+    # a second document and every later --argjson choked on it.
+    have="$(find "$AVATAR_DIR" -maxdepth 1 -type f -name '*.png' -printf '%f\n' 2>/dev/null \
+             | sed 's#\.png$##' | jq -R . | jq -sc 'map(select(length > 0))')"
+    [[ -n "$have" ]] || have='[]'
     cache="$(jq -c --argjson info "$info_map" --argjson have "$have" --arg dir "$AVATAR_DIR" '
       ($have | map({key: ., value: true}) | from_entries) as $h
       | reduce ($info | to_entries[] | select(.value.name != "")) as $e (.;

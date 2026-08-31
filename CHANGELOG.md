@@ -52,6 +52,15 @@
   downloads are batched the same way. A warm counts cycle drops from ~9s to
   ~2s; a cold open (empty caches) from ~15s to under 4s, with ~10× fewer
   processes spawned. Output is byte-for-byte unchanged.
+- Fixed: with no ImageMagick installed, or on any first run where no avatar
+  downloaded, `counts` returned nothing at all — no conversations, no names,
+  no unreads. Listing the avatar cache with a glob made the pipeline fail
+  under `pipefail` *after* `jq` had already printed, so the `|| echo '[]'`
+  fallback appended a second document and every later `--argjson` choked on
+  it. The listing uses `find`, which exits 0 on an empty directory, and the
+  fallback is no longer part of the pipeline. README lists ImageMagick
+  nowhere in Requirements, so this hit exactly the supported configuration.
+
 - **Unread counts now reach every conversation.** Slack has no bulk unread
   endpoint for a user token, so each conversation costs one
   `conversations.info` and only `MAX_CONV_INFO` fit in a cycle — and the same

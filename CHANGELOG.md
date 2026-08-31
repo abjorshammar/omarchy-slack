@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Fixed: `Esc` inside a conversation called `backToList()`, which was never
+  defined, so it threw instead of returning to the conversation list.
+
 ## 1.0.0
 
 Initial release.

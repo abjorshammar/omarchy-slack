@@ -283,6 +283,27 @@ check "status after clear" "$(jq -r '.has_token' <<<"$out")" "false"
 out="$(run counts)"
 check "counts without token errors" "$(jq -r '.error' <<<"$out")" "no token"
 
+# QML resolves method calls at run time, so a call to a function that was never
+# defined is silent until a user hits that code path — `root.backToList()` sat
+# in Escape's handler unnoticed. Nothing here parses QML; it just checks that
+# every `root.<name>(...)` call has a matching `function <name>`.
+echo "== every root.<fn>() call is defined"
+missing=0
+for f in "$HERE/../Panel.qml" "$HERE/../BarWidget.qml"; do
+  defined="$(grep -oE '^[[:space:]]*function[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' "$f" \
+             | awk '{print $2}' | sort -u)"
+  called="$(grep -oE 'root\.[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' "$f" \
+            | sed -E 's/^root\.//; s/[[:space:]]*\($//' | sort -u)"
+  while IFS= read -r fn; do
+    [[ -z "$fn" ]] && continue
+    if ! grep -qx "$fn" <<<"$defined"; then
+      fail "$(basename "$f") calls root.$fn() but never defines it"
+      missing=1
+    fi
+  done <<<"$called"
+done
+(( missing == 0 )) && ok "every root.<fn>() call resolves to a definition"
+
 echo "== secrets hygiene"
 if grep -q 'xoxp-1234567890' "$CURL_LOG"; then
   fail "token appeared on a curl argv"

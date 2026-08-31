@@ -81,7 +81,11 @@ respond() {
     conversations.history)
       if [[ -n "${FAKE_RATELIMIT:-}" ]]; then echo '{"ok":false,"error":"ratelimited"}'; return 0; fi
       echo '{"ok":true,"messages":[
-        {"type":"message","ts":"1755900002.000200","user":"U2222222","text":"newest <b>bold</b> &amp; stuff","reply_count":2,"thread_ts":"1755900002.000200"},
+        {"type":"message","ts":"1755900002.000200","user":"U2222222","text":"newest <b>bold</b> &amp; stuff","reply_count":2,"thread_ts":"1755900002.000200",
+         "files":[
+           {"id":"F0AAAAAA1","name":"shot.png","mimetype":"image/png","size":206236,"thumb_360":"https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_360.png","thumb_360_w":141,"thumb_360_h":360},
+           {"id":"F0BBBBBB2","name":"locked.png","mimetype":"image/png","size":1024,"thumb_360":"https://files.slack.com/files-tmb/T1-F0BBBBBB2/locked_360.png","thumb_360_w":100,"thumb_360_h":100},
+           {"id":"F0CCCCCC3","name":"notes.pdf","mimetype":"application/pdf","size":9000,"thumb_360":"https://files.slack.com/files-tmb/T1-F0CCCCCC3/notes_360.png","thumb_360_w":80,"thumb_360_h":80}]},
         {"type":"message","ts":"1755900001.000100","user":"U1111111","text":"older message"}]}' ;;
     conversations.replies)
       echo '{"ok":true,"messages":[
@@ -98,10 +102,24 @@ respond() {
 # url -> (method, channel, user, types) and dispatch to respond / avatar.
 handle_url() {
   local u="$1" out="$2" team="$3"
+  # Batched requests carry their URLs on stdin, not argv, so log them here or
+  # any check that greps the log for one silently passes on an empty match.
+  printf '%s\n' "URL: $u" >> "$CURL_LOG"
   case "$u" in
     https://*.slack-edge.com/*|https://secure.gravatar.com/*)
       # Avatar: emit a real, valid image so cache_avatar's magick convert works.
       if [[ -n "$out" ]]; then magick -size 8x8 xc:'#3366cc' "png:$out" 2>/dev/null || printf 'x' > "$out"; fi
+      return 0 ;;
+    https://files.slack.com/*)
+      # A real 1x1 PNG for the one file the token may read (base64, so this
+      # works with no ImageMagick), and Slack's HTML sign-in bounce for the
+      # other — which is exactly what a token without files:read receives,
+      # with a 200 and no error to distinguish it.
+      [[ -n "$out" ]] || return 0
+      case "$u" in
+        *F0AAAAAA1*) printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' | base64 -d > "$out" ;;
+        *) printf '<html><body>Sign in to continue</body></html>' > "$out" ;;
+      esac
       return 0 ;;
   esac
   local method ch="" user="" types=""
@@ -295,6 +313,34 @@ check "history exposes reply_count" "$(jq -r '.messages[] | select(.ts=="1755900
 check "history exposes thread_ts" "$(jq -r '.messages[] | select(.ts=="1755900002.000200") | .thread_ts' <<<"$out")" "1755900002.000200"
 check "avatar cached under its workspace" "$(jq -r '.users.U2222222.i | test("/omarchy-slack/'"$ACME"'/avatars/U2222222[.]png$")' <<<"$out")" "true"
 check "history cache lives under its workspace" "$([ -f "$CACHE/$ACME/hist-D0AAAAAA1.json" ] && echo yes)" "yes"
+
+# Attachments. Slack's thumbnails sit behind an auth wall, so they are fetched
+# here and cached; the QML side only ever gets a local path. A token without
+# files:read is not refused — it is handed an HTML sign-in page with a 200 —
+# so what came back is trusted only after its bytes are checked.
+echo "== attachments"
+FILES="$CACHE/$ACME/files"
+check "history keeps the files array" "$(jq -r '.messages[] | select(.ts=="1755900002.000200") | .files | length' <<<"$out")" "3"
+check "attachment carries its name" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | .name' <<<"$out")" "shot.png"
+check "attachment carries its size" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | .size' <<<"$out")" "206236"
+check "attachment carries thumbnail dimensions" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | "\(.w)x\(.h)"' <<<"$out")" "141x360"
+check "readable image cached locally" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | .path | test("/omarchy-slack/'"$ACME"'/files/F0AAAAAA1[.]png$")' <<<"$out")" "true"
+check "…and the file is really there" "$([ -s "$FILES/F0AAAAAA1.png" ] && echo yes)" "yes"
+check "…and it is 0600 like every other cache file" "$(stat -c %a "$FILES/F0AAAAAA1.png")" "600"
+check "…and Model.js accepts the path" "$(command -v node >/dev/null 2>&1 && node -e 'var M=require(process.argv[1]);process.stdout.write(String(M.validFilePath(process.argv[2])))' "$HERE/../Model.js" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | .path' <<<"$out")" || echo true)" "true"
+# The sign-in bounce must never reach an image decoder or the cache.
+check "an HTML sign-in page is not cached as an image" "$(jq -r '.messages[] | .files[]? | select(.id=="F0BBBBBB2") | .path' <<<"$out")" ""
+check "…and left nothing on disk" "$(compgen -G "$FILES/F0BBBBBB2.*" >/dev/null 2>&1 && echo yes || echo no)" "no"
+check "non-images are listed but not downloaded" "$(jq -r '.messages[] | .files[]? | select(.id=="F0CCCCCC3") | .path' <<<"$out")" ""
+check "…and were never requested" "$(grep -c F0CCCCCC3 "$CURL_LOG" || true)" "0"
+check "no download scratch dir survives" "$(compgen -G "$FILES/.dl.*" >/dev/null 2>&1 && echo yes || echo no)" "no"
+check "only images live in the files dir" "$(find "$FILES" -type f ! -name '*.png' ! -name '*.jpg' | wc -l)" "0"
+# Cached once, then reused: a second history call must not refetch it.
+n_before="$(grep -c F0AAAAAA1 "$CURL_LOG" || true)"
+rm -f "$CACHE/$ACME"/hist-D0AAAAAA1.json
+run history D0AAAAAA1 >/dev/null
+check "a cached thumbnail is not downloaded twice" "$(grep -c F0AAAAAA1 "$CURL_LOG" || true)" "$n_before"
+out="$(run history D0AAAAAA1)"
 n_before="$(grep -c conversations.history "$CURL_LOG")"
 out="$(run history D0AAAAAA1)"
 n_after="$(grep -c conversations.history "$CURL_LOG")"

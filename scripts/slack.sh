@@ -28,6 +28,7 @@ TEAM_ID=""
 TEAM_CACHE=""
 USERS_CACHE=""    # v2: values are {n,i}, i is a local PNG path
 AVATAR_DIR=""
+FILE_DIR=""
 CONV_STATE=""
 
 # Bounds. Slack method responses are small; the caps exist so a hostile or
@@ -42,6 +43,8 @@ HOT_SECONDS="${HOT_SECONDS:-5400}"     # activity this recent is polled every cy
 [[ "$HOT_SECONDS" =~ ^[0-9]{1,9}$ ]] || HOT_SECONDS=5400
 CONV_STATE_TTL=2592000     # 30d: forget a conversation not seen in that long
 MAX_USER_LOOKUPS=20        # users.info calls per cycle
+MAX_FILE_FETCH=12          # image thumbnails downloaded per history call
+FILE_CACHE_DAYS=30         # cached thumbnails are pruned after this long
 MAX_MSG_CHARS=4000         # chat.postMessage text cap (Slack's own limit)
 MAX_WORKSPACES=8           # workspaces polled by counts-all
 PARALLEL_MAX=4             # concurrent transfers in a batched curl (rate-safe)
@@ -76,6 +79,7 @@ write_atomic() {
 valid_team() { [[ "$1" =~ ^[TE][A-Z0-9]{2,30}$ ]]; }
 valid_channel() { [[ "$1" =~ ^[CDGW][A-Z0-9]{5,30}$ ]]; }
 valid_user() { [[ "$1" =~ ^[UW][A-Z0-9]{5,30}$ ]]; }
+valid_file() { [[ "$1" =~ ^F[A-Z0-9]{5,30}$ ]]; }
 valid_ts() { [[ "$1" =~ ^[0-9]{1,12}\.[0-9]{1,8}$ ]]; }
 
 # set_team_paths <team_id> — point the per-workspace caches at that team.
@@ -86,6 +90,7 @@ set_team_paths() {
   USERS_CACHE="$TEAM_CACHE/users-v2.json"
   CONV_STATE="$TEAM_CACHE/convstate.json"
   AVATAR_DIR="$TEAM_CACHE/avatars"
+  FILE_DIR="$TEAM_CACHE/files"
   mkdir -p "$TEAM_CACHE" 2>/dev/null || return 1
   chmod 700 "$TEAM_CACHE" 2>/dev/null || true
 }
@@ -445,7 +450,7 @@ oauth_config() {
   return 1
 }
 
-OAUTH_SCOPES="channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,chat:write,users:read,dnd:read,dnd:write,users:write"
+OAUTH_SCOPES="channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,chat:write,users:read,dnd:read,dnd:write,users:write,files:read"
 
 # Marking a conversation read on your phone and in the official clients needs
 # write access to each conversation type. They are heavier permissions than
@@ -640,6 +645,91 @@ batch_cache_avatars() {
     rm -f "$src"
   done
   rm -rf "$dldir"
+}
+
+# Slack file thumbnails live behind an auth wall on files.slack.com, so the
+# QML side cannot load one directly — Image has nowhere to put a bearer token,
+# and giving it one would put the token in a URL. They are fetched here
+# instead, with the same batched curl everything else uses, and cached under
+# the workspace's own 0700 dir.
+valid_file_url() { [[ "$1" =~ ^https://files\.slack\.com/ ]]; }
+
+# cache_files <json object {file_id: thumb_url}> — download the not-yet-cached
+# thumbnails in ONE parallel authenticated curl. Unlike avatars these need no
+# ImageMagick pass: Slack's thumbnails are already small jpeg/png, which Qt
+# decodes natively, so the file is kept as it came provided it really is one
+# of those. Anything else is dropped rather than handed to an image decoder.
+# Best-effort — a file that fails to download just renders as its name.
+cache_files() {
+  local map="$1"
+  mkdir -p "$FILE_DIR" 2>/dev/null || return 0
+  chmod 700 "$FILE_DIR" 2>/dev/null || true
+  # Images accumulate for as long as the conversations do; drop the ones that
+  # have not been looked at in a month rather than growing without bound.
+  find "$FILE_DIR" -maxdepth 1 -type f -atime "+$FILE_CACHE_DAYS" -delete 2>/dev/null || true
+
+  local dldir
+  dldir="$(mktemp -d "$FILE_DIR/.dl.XXXXXX")" || return 0
+  while IFS=$'\t' read -r fid url; do
+    [[ -z "$fid" || -z "$url" ]] && continue
+    valid_file "$fid" || continue
+    valid_file_url "$url" || continue
+    compgen -G "$FILE_DIR/$fid.*" >/dev/null 2>&1 && continue
+    printf '%s\t%s\n' "$url" "$dldir/$fid.src"
+  done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<<"$map" 2>/dev/null) | run_batch 1
+
+  local src fid mime
+  for src in "$dldir"/*.src; do
+    [[ -e "$src" ]] || continue
+    fid="$(basename "$src" .src)"
+    # A token without files:read is bounced to an HTML sign-in page rather
+    # than refused, so trust the bytes, never the request having "worked".
+    mime="$(file -b --mime-type "$src" 2>/dev/null || echo "")"
+    case "$mime" in
+      image/jpeg) mv -f "$src" "$FILE_DIR/$fid.jpg" ;;
+      image/png)  mv -f "$src" "$FILE_DIR/$fid.png" ;;
+      *)          rm -f "$src" ;;
+    esac
+  done
+  rm -rf "$dldir"
+}
+
+# cached_file <file_id> — the local thumbnail's path, or "".
+cached_file() {
+  local f
+  for f in "$FILE_DIR/$1.jpg" "$FILE_DIR/$1.png"; do
+    [[ -s "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  printf ''
+}
+
+# attach_files <messages-json> — download the image thumbnails these messages
+# reference (capped, batched, already-cached ones skipped) and stamp each file
+# with the local `path` it landed at. A file that has no local copy — not an
+# image, download failed, or the token lacks files:read — keeps path "" and
+# the UI shows its name instead.
+attach_files() {
+  local msgs="$1" want have
+  want="$(jq -c --argjson cap "$MAX_FILE_FETCH" '
+    [ .[].files[]?
+      | select((.mime // "") | startswith("image/"))
+      | select((.id // "") != "" and (.url // "") != "") ]
+    | unique_by(.id) | .[0:$cap]
+    | map({key: .id, value: .url}) | from_entries' <<<"$msgs" 2>/dev/null || echo '{}')"
+  [[ "$(jq 'length' <<<"$want" 2>/dev/null || echo 0)" -gt 0 ]] && cache_files "$want"
+
+  # Which ids ended up as a real image on disk, so `path` is never a path to a
+  # file that isn't there (the QML side would try to load it and fail). `find`
+  # rather than a glob, and the fallback outside the pipeline — see the same
+  # note in resolve_users.
+  have="$(find "$FILE_DIR" -maxdepth 1 -type f \( -name '*.jpg' -o -name '*.png' \) -printf '%f\n' 2>/dev/null \
+           | jq -R . | jq -sc 'map(select(length > 0))
+             | map({key: (sub("\\.(jpg|png)$"; "")), value: .}) | from_entries')"
+  [[ -n "$have" ]] || have='{}'
+  jq -c --argjson h "$have" --arg dir "$FILE_DIR" '
+    [ .[] | .files = [ .files[]?
+        | . + {path: (if $h[.id] then ($dir + "/" + $h[.id]) else "" end)} ] ]' <<<"$msgs" \
+    2>/dev/null || printf '%s' "$msgs"
 }
 
 # resolve_users <json array of user ids> — fetches at most MAX_USER_LOOKUPS
@@ -1023,7 +1113,13 @@ cmd_history() {
        username: (.username // ""), subtype: (.subtype // ""),
        reply_count: (.reply_count // 0), thread_ts: (.thread_ts // ""),
        reactions: [((.reactions // [])[]) | {name, count}],
+       files: [((.files // [])[]) | {
+         id: (.id // ""), name: ((.name // "") | .[0:120]),
+         mime: (.mimetype // ""), size: (.size // 0),
+         w: (.thumb_360_w // 0), h: (.thumb_360_h // 0),
+         url: (.thumb_360 // "")}],
        text: ((.text // "") | .[0:8000])}] | reverse' <<<"$res")"
+  msgs="$(attach_files "$msgs")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
   users="$(resolve_users "$uids")"
   # team and channel ride along so the UI can drop a payload that arrives
@@ -1075,7 +1171,13 @@ cmd_thread() {
        username: (.username // ""), subtype: (.subtype // ""),
        reply_count: (.reply_count // 0), thread_ts: (.thread_ts // ""),
        reactions: [((.reactions // [])[]) | {name, count}],
+       files: [((.files // [])[]) | {
+         id: (.id // ""), name: ((.name // "") | .[0:120]),
+         mime: (.mimetype // ""), size: (.size // 0),
+         w: (.thumb_360_w // 0), h: (.thumb_360_h // 0),
+         url: (.thumb_360 // "")}],
        text: ((.text // "") | .[0:8000])}]' <<<"$res")"
+  msgs="$(attach_files "$msgs")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
   users="$(resolve_users "$uids")"
   out="$(jq -cn --arg t "$TEAM_ID" --arg ch "$id" --arg ts "$ts" --argjson m "$msgs" --argjson u "$users" \

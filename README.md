@@ -25,6 +25,12 @@ mention badge keeps watch in your bar. No Electron, no half-gigabyte client.
   its own unread badge — `Ctrl+1…9` jumps straight to one. The rail only
   appears once you have more than one workspace, so nothing changes if you
   don't need it.
+- **Images, inline.** Screenshots and photos shared in a conversation render
+  in the message list. Slack keeps them behind an auth wall, so the plugin
+  fetches each thumbnail itself and caches it privately; other attachments
+  show as their name and size. Needs the `files:read` scope — a token
+  authorized before this existed keeps the scopes it was granted, so sign
+  that workspace out and back in to see images.
 - **Presence & Do Not Disturb.** Toggle active/away and snooze notifications
   for an hour from the sidebar.
 - **Made for Omarchy.** Every color comes from your active theme, light
@@ -163,6 +169,13 @@ the count it was last seen with instead of reporting zero. Set
 - Avatars are downloaded only from Slack's own image hosts (no redirects
   followed), size-capped, checked to be a real raster format, and converted
   with ImageMagick resource limits before display.
+- Message images are fetched only from `files.slack.com`, size-capped, and
+  cached `0600` under the workspace's own directory, keyed by Slack's file
+  id. A token lacking `files:read` is not refused — Slack answers `200` with
+  an HTML sign-in page — so the bytes are checked to be a real JPEG or PNG
+  before anything is kept or shown; anything else is discarded. The UI is
+  only ever handed a local path, never a URL, so no view can be made to
+  fetch a remote resource. Cached images not read for 30 days are removed.
 - The OAuth listener binds `127.0.0.1` only, accepts a single
   state-validated callback, and dies after four minutes. The client secret
   lives only in the OAuth proxy (a Cloudflare Worker env var), never in this

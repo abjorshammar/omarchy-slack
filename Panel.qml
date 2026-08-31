@@ -498,6 +498,7 @@ Item {
       daySep: "",
       firstUnread: false,
       reactions: [],
+      files: [],
       time: Qt.formatTime(new Date(), "HH:mm"),
       url: Model.firstUrl(sendProc.pendingText),
       text: Model.formatMessage(sendProc.pendingText, {}),
@@ -710,6 +711,60 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyCounts(text)
+    }
+  }
+
+  // An image attachment the script cached locally. Only ever a file:// path
+  // under this workspace's cache dir (Model.validFilePath), never a remote
+  // URL: files.slack.com needs an auth header Image cannot send.
+  Component {
+    id: imageAttachment
+    Item {
+      property var file: ({ path: "", w: 0, h: 0, name: "" })
+      // Slack's thumbnail is at most 360 on its long edge; scale it down to
+      // fit the pane but never up, so a small image is not blurred.
+      readonly property real maxW: Math.min(width > 0 ? width : 320, 320)
+      readonly property real scale_: (file.w > 0 && file.h > 0)
+        ? Math.min(maxW / file.w, 320 / file.h, 1) : 1
+      implicitHeight: file.h > 0 ? Math.round(file.h * scale_) : 0
+
+      Image {
+        source: parent.file.path
+        width: parent.file.w > 0 ? Math.round(parent.file.w * parent.scale_) : 0
+        height: parent.implicitHeight
+        fillMode: Image.PreserveAspectFit
+        asynchronous: true
+        // A cached image can be pruned out from under a stale payload; show
+        // nothing rather than a broken-image box.
+        visible: status === Image.Ready
+      }
+    }
+  }
+
+  // Everything else: a non-image, a download that failed, or a token without
+  // files:read. The name is all we have, and it beats a message that looks
+  // empty because its only content was an attachment.
+  Component {
+    id: namedAttachment
+    Row {
+      property var file: ({ name: "", size: "" })
+      spacing: Style.space(5)
+      Text {
+        text: ""  // nf-fa-paperclip
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Math.max(8, Style.font.caption - 1)
+        anchors.verticalCenter: parent.verticalCenter
+      }
+      Text {
+        textFormat: Text.PlainText
+        text: parent.file.name + (parent.file.size !== "" ? "  ·  " + parent.file.size : "")
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Math.max(8, Style.font.caption - 1)
+        elide: Text.ElideMiddle
+        anchors.verticalCenter: parent.verticalCenter
+      }
     }
   }
 
@@ -2426,6 +2481,26 @@ Item {
                           hoverEnabled: true
                           cursorShape: Qt.PointingHandCursor
                           onClicked: root.openUrl(md.modelData.url)
+                        }
+                      }
+
+                      // Attachments. An image the script managed to cache
+                      // renders inline; anything else — a non-image, a failed
+                      // download, or a token without files:read — shows as its
+                      // name so the message never looks empty.
+                      Column {
+                        visible: md.modelData.files.length > 0
+                        width: parent.width
+                        spacing: Style.space(4)
+
+                        Repeater {
+                          model: md.modelData.files
+                          Loader {
+                            required property var modelData
+                            width: parent.width
+                            sourceComponent: modelData.path !== "" ? imageAttachment : namedAttachment
+                            onLoaded: item.file = modelData
+                          }
                         }
                       }
 

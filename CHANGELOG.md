@@ -52,6 +52,29 @@
   downloads are batched the same way. A warm counts cycle drops from ~9s to
   ~2s; a cold open (empty caches) from ~15s to under 4s, with ~10× fewer
   processes spawned. Output is byte-for-byte unchanged.
+- **Images arrive.** `conversations.history` returns a `files` array that the
+  plugin threw away, so a message whose only content was a screenshot showed
+  as blank. Attachments now ride along, and images render inline in the
+  message list. Non-images — and images that could not be fetched — show as
+  their name and size, so a message is never empty.
+- Slack serves thumbnails from `files.slack.com` behind an auth wall, which a
+  QML `Image` cannot pass (there is nowhere to put a bearer token, and a token
+  in a URL is a token in a URL). They are fetched by `slack.sh` in the same
+  batched, capped, https-pinned `curl` everything else uses and cached `0600`
+  under the workspace's own dir, keyed by Slack file id; the UI is handed only
+  a local path. Unlike avatars they need no ImageMagick pass — Slack's
+  thumbnails are already small JPEG/PNG, which Qt decodes natively.
+- A token without `files:read` is not refused: Slack answers `200` with an
+  HTML sign-in page. The bytes are checked to be a real JPEG or PNG before
+  anything is kept, so the sign-in page never reaches an image decoder or the
+  cache — the attachment just falls back to its name.
+- `files:read` is now part of the requested scope set, and of the manifest in
+  `docs/OWN-APP.md`. Scopes are fixed at authorization, so a workspace signed
+  in before this keeps what it was granted: sign it out and back in to see
+  images.
+- Cached images not read for 30 days are pruned, so the directory cannot grow
+  without bound.
+
 - Fixed: with no ImageMagick installed, or on any first run where no avatar
   downloaded, `counts` returned nothing at all — no conversations, no names,
   no unreads. Listing the avatar cache with a glob made the pipeline fail

@@ -168,7 +168,9 @@ Item {
       ? "rate limited — showing cached messages"
       : (data.cached ? "cached · Slack allows one refresh per minute" : "")
     messages = Model.buildMessages(data, selfId, unreadBoundaryTs)
-    var ts = Model.lastTs(data)
+    // Reading advances the marker to the conversation's head, not merely the
+    // last message history returned — see Model.readMarkerTs.
+    var ts = Model.readMarkerTs(data, convo ? convo.latest : "")
     if (convo && ts !== "") markSeen(convo.id, ts)
     scrollToBottom()
   }
@@ -274,7 +276,7 @@ Item {
 
   function openConvo(c) {
     settingsMode = false
-    convo = { id: c.id, name: Model.displayName(c), kind: c.kind }
+    convo = { id: c.id, name: Model.displayName(c), kind: c.kind, latest: String(c.latest || "") }
     // Snapshot the read boundary before markSeen (on load) advances it.
     unreadBoundaryTs = seenMap[c.id] ? String(seenMap[c.id]) : ""
     selectedMsg = -1

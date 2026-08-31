@@ -8,6 +8,8 @@
   stayed lit forever — and `conversations.mark` was called with a ts behind
   Slack's own `last_read`, making it a no-op even with the optional write
   scopes. Slack assistant/app DMs hit this on every reply.
+- Fixed: `Esc` inside a conversation called `backToList()`, which was never
+  defined, so it threw instead of returning to the conversation list.
 
 ## 1.0.0
 

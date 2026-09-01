@@ -52,6 +52,21 @@
   downloads are batched the same way. A warm counts cycle drops from ~9s to
   ~2s; a cold open (empty caches) from ~15s to under 4s, with ~10× fewer
   processes spawned. Output is byte-for-byte unchanged.
+- Clicking an image fills the window with it; a click anywhere, or `Esc`,
+  closes it. The thumbnail appears at once, and the **original** — up to
+  Slack's whole 25 MiB — is fetched in the background and swapped in, then
+  cached beside the thumbnail. Only ever on demand: most attachments are
+  never opened, and one of this workspace's photos is 3000×4000 against a
+  270×360 thumbnail. New `slack.sh file-full <file_id> <url>`; the URL comes
+  back through the UI from a payload this script produced and is re-checked
+  here rather than trusted.
+- Cached thumbnails are Slack's 720 where it made one, falling back to 360:
+  still a small file, and sharper in the message list than a 360 scaled into
+  the same box.
+- A sent image now shows as the image immediately instead of as a filename
+  until the next history refresh. Slack has not made a thumbnail yet, but the
+  file that was just uploaded is on disk, so the local echo renders that.
+
 - **Images go out too.** `Ctrl+V` in the message box attaches whatever image
   is on the clipboard — screenshot, then paste — and a file dropped onto the
   conversation attaches that. Deliberately no file dialog: this desktop ships

@@ -59,6 +59,12 @@ function sendCommand(scriptDir, teamId, channelId, threadTs) {
   return a
 }
 
+// The original behind a thumbnail. The url came out of a history payload this
+// script produced; it is handed back and re-checked there, not trusted here.
+function fileFullCommand(scriptDir, teamId, fileId, url) {
+  return base(scriptDir, teamId).concat(["file-full", String(fileId), String(url)])
+}
+
 // Share a local file. The path is argv, never a shell word; the script
 // re-checks it is a readable regular file within Slack's size limit.
 function uploadCommand(scriptDir, teamId, channelId, path, threadTs) {
@@ -330,7 +336,9 @@ function userAvatar(users, id) {
 // remote is ever accepted here — files.slack.com needs an auth header Image
 // cannot send, so a path is the only thing that can actually render.
 function validFilePath(x) {
-  return /\/omarchy-slack\/[TE][A-Z0-9]+\/files\/F[A-Z0-9]+\.(jpg|png)$/.test(String(x || ""))
+  // "-full" is the original fetched for the full-window view, beside the
+  // thumbnail shown in the message list.
+  return /\/omarchy-slack\/[TE][A-Z0-9]+\/files\/F[A-Z0-9]+(-full)?\.(jpg|png)$/.test(String(x || ""))
 }
 
 function fileSource(x) {
@@ -367,6 +375,8 @@ function messageFiles(m) {
       name: String(f.name || "file"),
       size: fileSize(f.size),
       path: fileSource(f.path),
+      // Where the original lives, so the full-window view can ask for it.
+      full: String(f.full || ""),
       // Slack gives the thumbnail's own dimensions; they keep the image from
       // jumping as it loads and cap how tall one attachment can get.
       w: parseInt(f.w, 10) || 0,
@@ -607,6 +617,7 @@ if (typeof module !== "undefined") {
     countsAllCommand: countsAllCommand,
     countsCachedCommand: countsCachedCommand,
     uploadCommand: uploadCommand,
+    fileFullCommand: fileFullCommand,
     clipImageCommand: clipImageCommand,
     dropPath: dropPath,
     baseName: baseName,

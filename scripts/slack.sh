@@ -46,6 +46,7 @@ MAX_USER_LOOKUPS=20        # users.info calls per cycle
 MAX_FILE_FETCH=12          # image thumbnails downloaded per history call
 FILE_CACHE_DAYS=30         # cached thumbnails are pruned after this long
 MAX_UPLOAD_BYTES=26214400  # 25 MiB: Slack's own per-file limit for uploads
+MAX_IMAGE_BYTES=26214400   # a full-size image is not an API response; same 25 MiB
 MAX_MSG_CHARS=4000         # chat.postMessage text cap (Slack's own limit)
 MAX_WORKSPACES=8           # workspaces polled by counts-all
 PARALLEL_MAX=4             # concurrent transfers in a batched curl (rate-safe)
@@ -695,13 +696,51 @@ cache_files() {
   rm -rf "$dldir"
 }
 
-# cached_file <file_id> — the local thumbnail's path, or "".
+# cached_file <file_id> [suffix] — that file's local path, or "". The suffix
+# separates the thumbnail shown in the message list from the original fetched
+# for the full-window view.
 cached_file() {
   local f
-  for f in "$FILE_DIR/$1.jpg" "$FILE_DIR/$1.png"; do
+  for f in "$FILE_DIR/$1${2:-}.jpg" "$FILE_DIR/$1${2:-}.png"; do
     [[ -s "$f" ]] && { printf '%s' "$f"; return 0; }
   done
   printf ''
+}
+
+# file-full <file_id> <url> — the original behind a thumbnail, cached and its
+# path printed. Fetched only when someone actually opens the full-window view:
+# originals are up to Slack's whole 25 MiB limit, and most are never looked at.
+#
+# The URL comes back through the UI from a payload this script produced, and is
+# re-checked here — the UI is not where that decision gets made.
+cmd_file_full() {
+  require_token
+  local fid="${1:-}" url="${2:-}"
+  valid_file "$fid" || emit_error "bad file id"
+  valid_file_url "$url" || emit_error "bad file url"
+
+  local have
+  have="$(cached_file "$fid" "-full")"
+  [[ -n "$have" ]] && { jq -cn --arg p "$have" '{ok:true, path:$p, cached:true}'; exit 0; }
+
+  mkdir -p "$FILE_DIR" 2>/dev/null || emit_error "cannot create cache dir"
+  chmod 700 "$FILE_DIR" 2>/dev/null || true
+  local tmp
+  tmp="$(mktemp "$FILE_DIR/.full.XXXXXX")" || emit_error "cannot create cache dir"
+  curl -sS --proto '=https' --proto-redir '=https' --max-filesize "$MAX_IMAGE_BYTES" \
+    --max-time 60 -o "$tmp" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$TOKEN") "$url" 2>/dev/null \
+    || { rm -f "$tmp"; emit_error "could not fetch the image"; }
+
+  # A token without files:read is answered with an HTML sign-in page, not an
+  # error, so the bytes decide — the same rule as everywhere else here.
+  case "$(file -b --mime-type "$tmp" 2>/dev/null || echo "")" in
+    image/jpeg) mv -f "$tmp" "$FILE_DIR/$fid-full.jpg" ;;
+    image/png)  mv -f "$tmp" "$FILE_DIR/$fid-full.png" ;;
+    *) rm -f "$tmp"; emit_error "not an image" ;;
+  esac
+  jq -cn --arg p "$(cached_file "$fid" "-full")" '{ok:true, path:$p, cached:false}'
+  exit 0
 }
 
 # attach_files <messages-json> — download the image thumbnails these messages
@@ -1122,7 +1161,9 @@ cmd_history() {
          # full-window view has to work with.
          w: (.thumb_720_w // .thumb_360_w // 0),
          h: (.thumb_720_h // .thumb_360_h // 0),
-         url: (.thumb_720 // .thumb_360 // "")}],
+         url: (.thumb_720 // .thumb_360 // ""),
+         # The original, fetched only if the full-window view is opened.
+         full: (.url_private // "")}],
        text: ((.text // "") | .[0:8000])}] | reverse' <<<"$res")"
   msgs="$(attach_files "$msgs")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
@@ -1184,7 +1225,9 @@ cmd_thread() {
          # full-window view has to work with.
          w: (.thumb_720_w // .thumb_360_w // 0),
          h: (.thumb_720_h // .thumb_360_h // 0),
-         url: (.thumb_720 // .thumb_360 // "")}],
+         url: (.thumb_720 // .thumb_360 // ""),
+         # The original, fetched only if the full-window view is opened.
+         full: (.url_private // "")}],
        text: ((.text // "") | .[0:8000])}]' <<<"$res")"
   msgs="$(attach_files "$msgs")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
@@ -1443,6 +1486,7 @@ case "${1:-}" in
   send)            shift; cmd_send "$@" ;;
   upload)          shift; cmd_upload "$@" ;;
   clip-image)      cmd_clip_image ;;
+  file-full)       shift; cmd_file_full "$@" ;;
   seen)            shift; cmd_seen "$@" ;;
   presence)        shift; cmd_presence "$@" ;;
   snooze)          shift; cmd_snooze "$@" ;;

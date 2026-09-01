@@ -92,7 +92,7 @@ respond() {
       echo '{"ok":true,"messages":[
         {"type":"message","ts":"1755900002.000200","user":"U2222222","text":"newest <b>bold</b> &amp; stuff","reply_count":2,"thread_ts":"1755900002.000200",
          "files":[
-           {"id":"F0AAAAAA1","name":"shot.png","mimetype":"image/png","size":206236,"thumb_360":"https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_360.png","thumb_360_w":141,"thumb_360_h":360,"thumb_720":"https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_720.png","thumb_720_w":282,"thumb_720_h":720},
+           {"id":"F0AAAAAA1","name":"shot.png","mimetype":"image/png","size":206236,"thumb_360":"https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_360.png","thumb_360_w":141,"thumb_360_h":360,"thumb_720":"https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_720.png","thumb_720_w":282,"thumb_720_h":720,"url_private":"https://files.slack.com/files-pri/T1-F0AAAAAA1/shot.png"},
            {"id":"F0BBBBBB2","name":"locked.png","mimetype":"image/png","size":1024,"thumb_360":"https://files.slack.com/files-tmb/T1-F0BBBBBB2/locked_360.png","thumb_360_w":100,"thumb_360_h":100},
            {"id":"F0CCCCCC3","name":"notes.pdf","mimetype":"application/pdf","size":9000,"thumb_360":"https://files.slack.com/files-tmb/T1-F0CCCCCC3/notes_360.png","thumb_360_w":80,"thumb_360_h":80}]},
         {"type":"message","ts":"1755900001.000100","user":"U1111111","text":"older message"}]}' ;;
@@ -118,6 +118,14 @@ handle_url() {
     https://*.slack-edge.com/*|https://secure.gravatar.com/*)
       # Avatar: emit a real, valid image so cache_avatar's magick convert works.
       if [[ -n "$out" ]]; then magick -size 8x8 xc:'#3366cc' "png:$out" 2>/dev/null || printf 'x' > "$out"; fi
+      return 0 ;;
+    https://files.slack.com/files-pri/*)
+      # The original. A different, larger PNG than the thumbnail, so the suite
+      # can tell which one it got — or, with FAKE_LOCKED_FULL, the HTML
+      # sign-in page a token without files:read is answered with.
+      [[ -n "$out" ]] || return 0
+      if [[ -n "${FAKE_LOCKED_FULL:-}" ]]; then printf '<html>Sign in</html>' > "$out"; return 0; fi
+      printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFElEQVR42mNk+M/AwMDAxMAAAA4AAwHnAaMAAAAASUVORK5CYII=' | base64 -d > "$out"
       return 0 ;;
     https://files.slack.com/upload/*)
       # The signed PUT target. Record what was sent so the suite can prove the
@@ -173,6 +181,11 @@ for a in "$@"; do
 done
 for a in "$@"; do
   case "$a" in
+    https://files.slack.com/files-pri/*)
+      printf '%s\n' "URL: $a" >> "$CURL_LOG"
+      if [[ -n "${FAKE_LOCKED_FULL:-}" ]]; then printf '<html>Sign in</html>' > "$outfile"; exit 0; fi
+      printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFElEQVR42mNk+M/AwMDAxMAAAA4AAwHnAaMAAAAASUVORK5CYII=' | base64 -d > "$outfile"
+      exit 0 ;;
     https://files.slack.com/upload/*)
       printf '%s\n' "UPLOAD: $a" >> "$CURL_LOG"
       [[ -n "$hdr" ]] && printf '%s\n' "UPLOAD-AUTH: $hdr" >> "$CURL_LOG"
@@ -365,6 +378,31 @@ n_before="$(grep -c F0AAAAAA1 "$CURL_LOG" || true)"
 rm -f "$CACHE/$ACME"/hist-D0AAAAAA1.json
 run history D0AAAAAA1 >/dev/null
 check "a cached thumbnail is not downloaded twice" "$(grep -c F0AAAAAA1 "$CURL_LOG" || true)" "$n_before"
+
+# The original, fetched only when the full-window view is opened — most never
+# are, and they run to Slack's whole 25 MiB limit.
+check "the payload carries the original's url" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | .full' <<<"$out")" "https://files.slack.com/files-pri/T1-F0AAAAAA1/shot.png"
+check "the original is not fetched up front" "$(grep -c 'files-pri' "$CURL_LOG" || true)" "0"
+full="$(run file-full F0AAAAAA1 "https://files.slack.com/files-pri/T1-F0AAAAAA1/shot.png")"
+check "file-full ok" "$(jq -r '.ok' <<<"$full")" "true"
+check "…cached beside the thumbnail, not over it" "$(jq -r '.path' <<<"$full" | grep -c 'F0AAAAAA1-full[.]png$')" "1"
+check "…the thumbnail is still there" "$([ -s "$FILES/F0AAAAAA1.png" ] && echo yes)" "yes"
+check "…and it really is the bigger image" "$([ "$(stat -c %s "$FILES/F0AAAAAA1-full.png")" -gt "$(stat -c %s "$FILES/F0AAAAAA1.png")" ] && echo yes)" "yes"
+check "…0600 like every other cache file" "$(stat -c %a "$FILES/F0AAAAAA1-full.png")" "600"
+check "…and Model.js accepts the path" "$(command -v node >/dev/null 2>&1 && node -e 'var M=require(process.argv[1]);process.stdout.write(String(M.validFilePath(process.argv[2])))' "$HERE/../Model.js" "$(jq -r '.path' <<<"$full")" || echo true)" "true"
+n_before="$(grep -c 'files-pri' "$CURL_LOG" || true)"
+check "a second open is served from cache" "$(run file-full F0AAAAAA1 "https://files.slack.com/files-pri/T1-F0AAAAAA1/shot.png" | jq -r '.cached')" "true"
+check "…and fetched nothing" "$(grep -c 'files-pri' "$CURL_LOG" || true)" "$n_before"
+# The url comes back through the UI, so it is re-checked here rather than trusted.
+check "refuses a file url off files.slack.com" "$(run file-full F0AAAAAA1 'https://evil.example/x.png' | jq -r '.error')" "bad file url"
+check "refuses a bad file id" "$(run file-full 'not-an-id' 'https://files.slack.com/files-pri/x.png' | jq -r '.error')" "bad file id"
+rm -f "$FILES/F0AAAAAA1-full.png"
+# Same rule as everywhere: a token without files:read gets a 200 and an HTML
+# sign-in page, so the bytes decide, not the request having "worked".
+out2="$(FAKE_LOCKED_FULL=1 run file-full F0AAAAAA1 "https://files.slack.com/files-pri/T1-F0AAAAAA1/shot.png")"
+check "a sign-in page is not cached as the original" "$(jq -r '.error' <<<"$out2")" "not an image"
+check "…and left nothing behind" "$(compgen -G "$FILES/F0AAAAAA1-full.*" >/dev/null 2>&1 && echo yes || echo no)" "no"
+check "…nor any scratch file" "$(compgen -G "$FILES/.full.*" >/dev/null 2>&1 && echo yes || echo no)" "no"
 out="$(run history D0AAAAAA1)"
 n_before="$(grep -c conversations.history "$CURL_LOG")"
 out="$(run history D0AAAAAA1)"

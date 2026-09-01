@@ -27,9 +27,10 @@ mention badge keeps watch in your bar. No Electron, no half-gigabyte client.
   don't need it.
 - **Images, in and out.** Screenshots and photos shared in a conversation
   render in the message list; other attachments show as their name and size.
-  To send one, take a screenshot and press `Ctrl+V` in the message box, or
-  drop a file onto the conversation — there is no file dialog to wade
-  through. Needs the `files:read` and `files:write` scopes; a token
+  Click one to fill the window with it — the original, not the thumbnail,
+  fetched at that moment and then cached. To send one, take a screenshot and
+  press `Ctrl+V` in the message box, or drop a file onto the conversation —
+  there is no file dialog to wade through. Needs the `files:read` and `files:write` scopes; a token
   authorized before these existed keeps the scopes it was granted, so sign
   that workspace out and back in.
 - **Presence & Do Not Disturb.** Toggle active/away and snooze notifications
@@ -180,7 +181,8 @@ the count it was last seen with instead of reporting zero. Set
   `0600` file under your cache; abandoned pastes are cleared after an hour.
 - Message images are fetched only from `files.slack.com`, size-capped, and
   cached `0600` under the workspace's own directory, keyed by Slack's file
-  id. A token lacking `files:read` is not refused — Slack answers `200` with
+  id. Full-size originals are fetched only when one is actually opened, from
+  a URL the plugin itself produced and re-checks. A token lacking `files:read` is not refused — Slack answers `200` with
   an HTML sign-in page — so the bytes are checked to be a real JPEG or PNG
   before anything is kept or shown; anything else is discarded. The UI is
   only ever handed a local path, never a URL, so no view can be made to

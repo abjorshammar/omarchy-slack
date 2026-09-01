@@ -98,7 +98,11 @@ Item {
   property string flash: ""
   property bool showShortcuts: false
   // The attachment currently shown full-window, as a file:// url. "" = none.
+  // It starts as the thumbnail — already on disk, so the view opens at once —
+  // and is replaced by the original as soon as that has been fetched.
   property string viewingImage: ""
+  property string viewingFileId: ""
+  property bool viewingFullLoading: false
 
   // Thread view: threadTs != "" means the message pane is showing a thread's
   // replies instead of the conversation root.
@@ -346,8 +350,36 @@ Item {
   }
 
   // Only ever hands http(s) URLs to the opener.
-  function openImage(src) {
-    if (String(src || "") !== "") viewingImage = String(src)
+  function openImage(f) {
+    var thumb = String((f && f.path) || "")
+    if (thumb === "") return
+    viewingImage = thumb
+    viewingFileId = String((f && f.id) || "")
+    viewingFullLoading = false
+    // Originals run to Slack's whole 25 MiB limit and most are never opened,
+    // so one is fetched only now, and only once — the script caches it.
+    var full = String((f && f.full) || "")
+    if (viewingFileId === "" || full === "" || fullProc.running) return
+    viewingFullLoading = true
+    fullProc.forId = viewingFileId
+    fullProc.cmd = Model.fileFullCommand(scriptDir, activeTeam, viewingFileId, full)
+    fullProc.running = true
+  }
+
+  function closeImage() {
+    viewingImage = ""
+    viewingFileId = ""
+    viewingFullLoading = false
+  }
+
+  function fullImageFinished(raw) {
+    viewingFullLoading = false
+    var data = Model.parseJson(raw)
+    // Either way the thumbnail stays on screen; the original is an upgrade,
+    // not a requirement. And the viewer may have moved on while it loaded.
+    if (!data.ok || fullProc.forId !== viewingFileId) return
+    var src = Model.fileSource(data.path)
+    if (src !== "") viewingImage = src
   }
 
   function openUrl(u) {
@@ -806,7 +838,7 @@ Item {
           anchors.fill: parent
           hoverEnabled: true
           cursorShape: Qt.PointingHandCursor
-          onClicked: root.openImage(att.file.path)
+          onClicked: root.openImage(att.file)
         }
       }
     }
@@ -889,6 +921,18 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.sendFinished(text)
+    }
+  }
+
+  // The original behind a thumbnail, fetched when the full-window view opens.
+  Process {
+    id: fullProc
+    property string forId: ""
+    property var cmd: ["true"]
+    command: cmd
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.fullImageFinished(text)
     }
   }
 
@@ -995,7 +1039,7 @@ Item {
           }
           var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
           if (event.key === Qt.Key_Escape) {
-            if (root.viewingImage !== "") root.viewingImage = ""
+            if (root.viewingImage !== "") root.closeImage()
             else if (root.addingWorkspace) root.cancelAddWorkspace()
             else if (root.threadTs !== "") root.closeThread()
             else if (inConvo) root.backToList()
@@ -2924,7 +2968,7 @@ Item {
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.bottom: parent.bottom
             anchors.bottomMargin: Style.space(16)
-            text: "click anywhere to close"
+            text: root.viewingFullLoading ? "loading full size…" : "click anywhere to close"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -2933,7 +2977,7 @@ Item {
           MouseArea {
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
-            onClicked: root.viewingImage = ""
+            onClicked: root.closeImage()
           }
         }
 

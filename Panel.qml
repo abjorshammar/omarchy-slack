@@ -97,12 +97,20 @@ Item {
   property int selectedMsg: -1
   property string flash: ""
   property bool showShortcuts: false
+  // The attachment currently shown full-window, as a file:// url. "" = none.
+  // It starts as the thumbnail — already on disk, so the view opens at once —
+  // and is replaced by the original as soon as that has been fetched.
+  property string viewingImage: ""
+  property string viewingFileId: ""
 
   // Thread view: threadTs != "" means the message pane is showing a thread's
   // replies instead of the conversation root.
   property string threadTs: ""
   property var threadMessages: []
   property bool threadLoading: false
+  // A file staged for the next send: {path, name}. There is no file dialog on
+  // this desktop, so it is staged by pasting an image or dropping a file.
+  property var pendingFile: null
   property string threadError: ""
   readonly property var displayMessages: threadTs !== "" ? threadMessages : messages
 
@@ -341,6 +349,34 @@ Item {
   }
 
   // Only ever hands http(s) URLs to the opener.
+  function openImage(f) {
+    var thumb = String((f && f.path) || "")
+    if (thumb === "") return
+    viewingImage = thumb
+    viewingFileId = String((f && f.id) || "")
+    // Originals run to Slack's whole 25 MiB limit and most are never opened,
+    // so one is fetched only now, and only once — the script caches it.
+    var full = String((f && f.full) || "")
+    if (viewingFileId === "" || full === "" || fullProc.running) return
+    fullProc.forId = viewingFileId
+    fullProc.cmd = Model.fileFullCommand(scriptDir, activeTeam, viewingFileId, full)
+    fullProc.running = true
+  }
+
+  function closeImage() {
+    viewingImage = ""
+    viewingFileId = ""
+  }
+
+  function fullImageFinished(raw) {
+    var data = Model.parseJson(raw)
+    // Either way the thumbnail stays on screen; the original is an upgrade,
+    // not a requirement. And the viewer may have moved on while it loaded.
+    if (!data.ok || fullProc.forId !== viewingFileId) return
+    var src = Model.fileSource(data.path)
+    if (src !== "") viewingImage = src
+  }
+
   function openUrl(u) {
     if (u && /^https?:\/\//i.test(String(u)))
       Quickshell.execDetached(["xdg-open", String(u)])
@@ -458,18 +494,43 @@ Item {
     historyProc.running = true
   }
 
+  function attachFromClipboard() {
+    if (sending || clipProc.running) return
+    clipProc.running = true
+  }
+
+  function attachPath(path) {
+    var p = String(path || "")
+    if (p === "" || sending) return
+    sendError = ""
+    pendingFile = { path: p, name: Model.baseName(p) }
+  }
+
+  function clearAttachment() {
+    pendingFile = null
+  }
+
   function sendMessage() {
-    var text = composeField.text
-    if (!convo || sending || String(text).replace(/\s+/g, "") === "") return
+    var text = String(composeField.text)
+    if (!convo || sending) return
+    // A staged file can go on its own; plain text still cannot be empty.
+    if (!pendingFile && text.replace(/\s+/g, "") === "") return
     sending = true
     sendError = ""
     // Snapshot the destination now — a live binding could re-resolve to a
     // different conversation between here and process start. In a thread,
     // reply into it (thread_ts).
-    sendProc.cmd = Model.sendCommand(scriptDir, activeTeam, convo.id, threadTs !== "" ? threadTs : "")
+    var tt = threadTs !== "" ? threadTs : ""
+    sendProc.cmd = pendingFile
+      ? Model.uploadCommand(scriptDir, activeTeam, convo.id, pendingFile.path, tt)
+      : Model.sendCommand(scriptDir, activeTeam, convo.id, tt)
     sendProc.team = activeTeam
     sendProc.intoThread = threadTs !== ""
-    sendProc.pendingText = String(text)
+    // The upload takes its comment on stdin too, so text travels the same way
+    // it always has — never argv.
+    sendProc.pendingText = text
+    sendProc.pendingFileName = pendingFile ? pendingFile.name : ""
+    sendProc.pendingFilePath = pendingFile ? pendingFile.path : ""
     sendProc.stdinEnabled = true
     sendProc.running = true
   }
@@ -482,7 +543,12 @@ Item {
     // conversation.
     if (sendProc.team !== activeTeam) return
     if (!data.ok) {
-      sendError = Model.friendlyError(data.error)
+      // Uploading needs files:write, and scopes are fixed at authorization —
+      // so for a workspace signed in before uploads existed the fix is not
+      // "see README", it is "sign out and back in".
+      sendError = (String(data.error) === "missing_scope" && sendProc.pendingFileName !== "")
+        ? "this workspace's token cannot upload — sign it out and back in (⚙) to grant it"
+        : Model.friendlyError(data.error)
       return
     }
     // Append locally instead of refetching — history is 1 request/minute.
@@ -498,7 +564,13 @@ Item {
       daySep: "",
       firstUnread: false,
       reactions: [],
-      files: [],
+      // The file we just uploaded, straight off disk. Slack has not made a
+      // thumbnail yet, and waiting for one meant a sent image showed as a
+      // filename until the next history refresh — or a reload.
+      files: sendProc.pendingFileName !== ""
+        ? [{ id: "", name: sendProc.pendingFileName, size: "",
+             path: Model.localImageSource(sendProc.pendingFilePath), w: 0, h: 0 }]
+        : [],
       time: Qt.formatTime(new Date(), "HH:mm"),
       url: Model.firstUrl(sendProc.pendingText),
       text: Model.formatMessage(sendProc.pendingText, {}),
@@ -510,8 +582,22 @@ Item {
       var mine = messages.slice(); mine.push(row); messages = mine
     }
     composeField.text = ""
+    clearAttachment()
     if (convo && data.ts) markSeen(convo.id, String(data.ts))
     scrollToBottom()
+  }
+
+  function clipFinished(raw) {
+    var data = Model.parseJson(raw)
+    if (!data.ok) {
+      // Ctrl+V is not claimed, so the field still pastes text normally and
+      // this fires on every text paste. "no image" is the ordinary case, not
+      // something to warn about; anything else is worth saying.
+      if (String(data.error) !== "no image on the clipboard")
+        sendError = Model.friendlyError(data.error)
+      return
+    }
+    attachPath(data.path)
   }
 
   function startLogin() {
@@ -720,23 +806,35 @@ Item {
   Component {
     id: imageAttachment
     Item {
+      id: att
       property var file: ({ path: "", w: 0, h: 0, name: "" })
-      // Slack's thumbnail is at most 360 on its long edge; scale it down to
-      // fit the pane but never up, so a small image is not blurred.
-      readonly property real maxW: Math.min(width > 0 ? width : 320, 320)
-      readonly property real scale_: (file.w > 0 && file.h > 0)
-        ? Math.min(maxW / file.w, 320 / file.h, 1) : 1
-      implicitHeight: file.h > 0 ? Math.round(file.h * scale_) : 0
+      // Slack's dimensions are only a hint for before the image has loaded.
+      // The real ones come from the file itself, so a local echo of something
+      // just sent sizes correctly with no metadata at all.
+      readonly property real nw: img.implicitWidth > 0 ? img.implicitWidth : (file.w || 0)
+      readonly property real nh: img.implicitHeight > 0 ? img.implicitHeight : (file.h || 0)
+      // Scaled down to fit the pane, never up: a small image stays sharp.
+      readonly property real box: Math.min(width > 0 ? width : 320, 320)
+      readonly property real k: (nw > 0 && nh > 0) ? Math.min(box / nw, 320 / nh, 1) : 0
+      implicitHeight: k > 0 ? Math.round(nh * k) : 0
 
       Image {
-        source: parent.file.path
-        width: parent.file.w > 0 ? Math.round(parent.file.w * parent.scale_) : 0
-        height: parent.implicitHeight
+        id: img
+        source: att.file.path
+        width: att.k > 0 ? Math.round(att.nw * att.k) : 0
+        height: att.implicitHeight
         fillMode: Image.PreserveAspectFit
         asynchronous: true
         // A cached image can be pruned out from under a stale payload; show
         // nothing rather than a broken-image box.
         visible: status === Image.Ready
+
+        MouseArea {
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.openImage(att.file)
+        }
       }
     }
   }
@@ -804,6 +902,8 @@ Item {
   Process {
     id: sendProc
     property string pendingText: ""
+    property string pendingFileName: ""
+    property string pendingFilePath: ""
     property string team: ""
     property bool intoThread: false
     property var cmd: ["true"]
@@ -816,6 +916,28 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.sendFinished(text)
+    }
+  }
+
+  // The original behind a thumbnail, fetched when the full-window view opens.
+  Process {
+    id: fullProc
+    property string forId: ""
+    property var cmd: ["true"]
+    command: cmd
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.fullImageFinished(text)
+    }
+  }
+
+  // Whatever image is on the Wayland clipboard, written to a private file.
+  Process {
+    id: clipProc
+    command: Model.clipImageCommand(root.scriptDir)
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.clipFinished(text)
     }
   }
 
@@ -912,7 +1034,8 @@ Item {
           }
           var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
           if (event.key === Qt.Key_Escape) {
-            if (root.addingWorkspace) root.cancelAddWorkspace()
+            if (root.viewingImage !== "") root.closeImage()
+            else if (root.addingWorkspace) root.cancelAddWorkspace()
             else if (root.threadTs !== "") root.closeThread()
             else if (inConvo) root.backToList()
             else root.dismiss()
@@ -2213,7 +2336,35 @@ Item {
               id: messageArea
               visible: !root.settingsMode && root.convo !== null
               width: parent.width
-              height: parent.height - Style.space(24) - composeRow.height - Style.space(24)
+              height: parent.height - Style.space(24) - composeRow.height
+                      - attachChip.height - sendErrorText.height - Style.space(24)
+
+              // Drop a file anywhere over the conversation to stage it. The
+              // other half of "there is no file dialog on this desktop"; only
+              // local files, and only one — a send carries one attachment.
+              DropArea {
+                id: dropTarget
+                anchors.fill: parent
+                z: 10
+                onDropped: function(drop) {
+                  var urls = drop.urls || []
+                  for (var i = 0; i < urls.length; i++) {
+                    var p = Model.dropPath(urls[i])
+                    if (p !== "") { root.attachPath(p); drop.accept(); return }
+                  }
+                }
+              }
+
+              // A file is over the conversation and will be staged if dropped.
+              Rectangle {
+                anchors.fill: parent
+                z: 9
+                visible: dropTarget.containsDrag
+                color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.10)
+                border.width: 1
+                border.color: Color.accent
+                radius: root.cornerRadius
+              }
 
               Text {
                 textFormat: Text.PlainText
@@ -2626,6 +2777,73 @@ Item {
               }
             }
 
+            // Why the last send did not go through. Above the compose box, not
+            // below it: below, it rendered past the bottom edge of the window
+            // and a failed send looked like nothing happening at all.
+            Text {
+              id: sendErrorText
+              textFormat: Text.PlainText
+              visible: !root.settingsMode && root.sendError !== ""
+              width: parent.width
+              height: visible ? implicitHeight : 0
+              text: "⚠ " + root.sendError
+              color: Color.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            // What is staged for the next send. Clicking ✕ drops it; sending
+            // clears it. Kept above the compose box so it is impossible to
+            // send an attachment without having seen that it is attached.
+            Rectangle {
+              id: attachChip
+              visible: !root.settingsMode && root.convo !== null && root.pendingFile !== null
+              height: visible ? chipRow.implicitHeight + Style.space(8) : 0
+              width: chipRow.implicitWidth + Style.space(14)
+              radius: root.cornerRadius
+              color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.14)
+              border.width: 1
+              border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.5)
+
+              Row {
+                id: chipRow
+                anchors.centerIn: parent
+                spacing: Style.space(6)
+                Text {
+                  text: ""  // nf-fa-paperclip
+                  color: Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Math.max(8, Style.font.caption - 1)
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.pendingFile ? root.pendingFile.name : ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideMiddle
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Text {
+                  text: "✕"
+                  color: dropChipArea.containsMouse ? Color.urgent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                  MouseArea {
+                    id: dropChipArea
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(4)
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.clearAttachment()
+                  }
+                }
+              }
+            }
+
             Item {
               id: composeRow
               visible: !root.settingsMode && root.convo !== null
@@ -2649,6 +2867,11 @@ Item {
                   } else if (event.key === Qt.Key_Escape) {
                     keyCatcher.forceActiveFocus()
                     event.accepted = true
+                  } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_V) {
+                    // Screenshot, then paste — the way images actually get
+                    // sent. Only claim the key when the clipboard really
+                    // holds an image, so pasting text still pastes text.
+                    root.attachFromClipboard()
                   }
                 }
               }
@@ -2683,16 +2906,6 @@ Item {
               }
             }
 
-            Text {
-              textFormat: Text.PlainText
-              visible: !root.settingsMode && root.sendError !== ""
-              width: parent.width
-              text: "⚠ " + root.sendError
-              color: Color.urgent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
           }
         }
 
@@ -2715,6 +2928,40 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             font.bold: true
+          }
+        }
+
+        // ---- full-window image viewer ----
+        // Click an attachment to fill the window with it; click anywhere (or
+        // Esc) to close. Scaled down to fit, never up — a thumbnail blown
+        // past its own resolution just looks worse than it is.
+        Rectangle {
+          id: imageViewer
+          visible: root.viewingImage !== ""
+          anchors.fill: parent
+          z: 100
+          color: Qt.rgba(root.background.r, root.background.g, root.background.b, 0.94)
+
+          readonly property real box_w: width - Style.space(48)
+          readonly property real box_h: height - Style.space(48)
+          readonly property real k: (bigImage.implicitWidth > 0 && bigImage.implicitHeight > 0)
+            ? Math.min(box_w / bigImage.implicitWidth, box_h / bigImage.implicitHeight, 1) : 0
+
+          Image {
+            id: bigImage
+            anchors.centerIn: parent
+            source: root.viewingImage
+            width: imageViewer.k > 0 ? Math.round(implicitWidth * imageViewer.k) : 0
+            height: imageViewer.k > 0 ? Math.round(implicitHeight * imageViewer.k) : 0
+            fillMode: Image.PreserveAspectFit
+            asynchronous: true
+            visible: status === Image.Ready
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.closeImage()
           }
         }
 

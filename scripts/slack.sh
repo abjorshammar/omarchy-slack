@@ -45,6 +45,8 @@ CONV_STATE_TTL=2592000     # 30d: forget a conversation not seen in that long
 MAX_USER_LOOKUPS=20        # users.info calls per cycle
 MAX_FILE_FETCH=12          # image thumbnails downloaded per history call
 FILE_CACHE_DAYS=30         # cached thumbnails are pruned after this long
+MAX_UPLOAD_BYTES=26214400  # 25 MiB: Slack's own per-file limit for uploads
+MAX_IMAGE_BYTES=26214400   # a full-size image is not an API response; same 25 MiB
 MAX_MSG_CHARS=4000         # chat.postMessage text cap (Slack's own limit)
 MAX_WORKSPACES=8           # workspaces polled by counts-all
 PARALLEL_MAX=4             # concurrent transfers in a batched curl (rate-safe)
@@ -450,7 +452,7 @@ oauth_config() {
   return 1
 }
 
-OAUTH_SCOPES="channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,chat:write,users:read,dnd:read,dnd:write,users:write,files:read"
+OAUTH_SCOPES="channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,chat:write,users:read,dnd:read,dnd:write,users:write,files:read,files:write"
 
 # Marking a conversation read on your phone and in the official clients needs
 # write access to each conversation type. They are heavier permissions than
@@ -694,13 +696,51 @@ cache_files() {
   rm -rf "$dldir"
 }
 
-# cached_file <file_id> — the local thumbnail's path, or "".
+# cached_file <file_id> [suffix] — that file's local path, or "". The suffix
+# separates the thumbnail shown in the message list from the original fetched
+# for the full-window view.
 cached_file() {
   local f
-  for f in "$FILE_DIR/$1.jpg" "$FILE_DIR/$1.png"; do
+  for f in "$FILE_DIR/$1${2:-}.jpg" "$FILE_DIR/$1${2:-}.png"; do
     [[ -s "$f" ]] && { printf '%s' "$f"; return 0; }
   done
   printf ''
+}
+
+# file-full <file_id> <url> — the original behind a thumbnail, cached and its
+# path printed. Fetched only when someone actually opens the full-window view:
+# originals are up to Slack's whole 25 MiB limit, and most are never looked at.
+#
+# The URL comes back through the UI from a payload this script produced, and is
+# re-checked here — the UI is not where that decision gets made.
+cmd_file_full() {
+  require_token
+  local fid="${1:-}" url="${2:-}"
+  valid_file "$fid" || emit_error "bad file id"
+  valid_file_url "$url" || emit_error "bad file url"
+
+  local have
+  have="$(cached_file "$fid" "-full")"
+  [[ -n "$have" ]] && { jq -cn --arg p "$have" '{ok:true, path:$p, cached:true}'; exit 0; }
+
+  mkdir -p "$FILE_DIR" 2>/dev/null || emit_error "cannot create cache dir"
+  chmod 700 "$FILE_DIR" 2>/dev/null || true
+  local tmp
+  tmp="$(mktemp "$FILE_DIR/.full.XXXXXX")" || emit_error "cannot create cache dir"
+  curl -sS --proto '=https' --proto-redir '=https' --max-filesize "$MAX_IMAGE_BYTES" \
+    --max-time 60 -o "$tmp" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$TOKEN") "$url" 2>/dev/null \
+    || { rm -f "$tmp"; emit_error "could not fetch the image"; }
+
+  # A token without files:read is answered with an HTML sign-in page, not an
+  # error, so the bytes decide — the same rule as everywhere else here.
+  case "$(file -b --mime-type "$tmp" 2>/dev/null || echo "")" in
+    image/jpeg) mv -f "$tmp" "$FILE_DIR/$fid-full.jpg" ;;
+    image/png)  mv -f "$tmp" "$FILE_DIR/$fid-full.png" ;;
+    *) rm -f "$tmp"; emit_error "not an image" ;;
+  esac
+  jq -cn --arg p "$(cached_file "$fid" "-full")" '{ok:true, path:$p, cached:false}'
+  exit 0
 }
 
 # attach_files <messages-json> — download the image thumbnails these messages
@@ -1116,8 +1156,14 @@ cmd_history() {
        files: [((.files // [])[]) | {
          id: (.id // ""), name: ((.name // "") | .[0:120]),
          mime: (.mimetype // ""), size: (.size // 0),
-         w: (.thumb_360_w // 0), h: (.thumb_360_h // 0),
-         url: (.thumb_360 // "")}],
+         # 720 where Slack made one: it is still a small file, it renders
+         # sharper than a 360 scaled to the same box, and it is what the
+         # full-window view has to work with.
+         w: (.thumb_720_w // .thumb_360_w // 0),
+         h: (.thumb_720_h // .thumb_360_h // 0),
+         url: (.thumb_720 // .thumb_360 // ""),
+         # The original, fetched only if the full-window view is opened.
+         full: (.url_private // "")}],
        text: ((.text // "") | .[0:8000])}] | reverse' <<<"$res")"
   msgs="$(attach_files "$msgs")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
@@ -1174,8 +1220,14 @@ cmd_thread() {
        files: [((.files // [])[]) | {
          id: (.id // ""), name: ((.name // "") | .[0:120]),
          mime: (.mimetype // ""), size: (.size // 0),
-         w: (.thumb_360_w // 0), h: (.thumb_360_h // 0),
-         url: (.thumb_360 // "")}],
+         # 720 where Slack made one: it is still a small file, it renders
+         # sharper than a 360 scaled to the same box, and it is what the
+         # full-window view has to work with.
+         w: (.thumb_720_w // .thumb_360_w // 0),
+         h: (.thumb_720_h // .thumb_360_h // 0),
+         url: (.thumb_720 // .thumb_360 // ""),
+         # The original, fetched only if the full-window view is opened.
+         full: (.url_private // "")}],
        text: ((.text // "") | .[0:8000])}]' <<<"$res")"
   msgs="$(attach_files "$msgs")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
@@ -1184,6 +1236,113 @@ cmd_thread() {
     '{ok:true, team_id:$t, channel:$ch, thread_ts:$ts, messages:$m, users:$u}')"
   write_atomic "$cache_file" "$out"
   printf '%s\n' "$out"
+}
+
+# --------------------------------------------------------------------- upload
+
+# clip-image — if the Wayland clipboard holds an image, write it to a private
+# file and print its path. This is what makes "screenshot, then paste" work:
+# there is no file dialog on this desktop (no zenity, no kdialog), and asking
+# QML to hold image bytes would mean passing them through argv.
+cmd_clip_image() {
+  command -v wl-paste >/dev/null 2>&1 || emit_error "no clipboard tool"
+  local types mime ext
+  types="$(wl-paste --list-types 2>/dev/null || true)"
+  case "$types" in
+    *image/png*)  mime=image/png;  ext=png ;;
+    *image/jpeg*) mime=image/jpeg; ext=jpg ;;
+    *) emit_error "no image on the clipboard" ;;
+  esac
+
+  local dir="$CACHE_DIR/outgoing"
+  mkdir -p "$dir" 2>/dev/null || emit_error "cannot create cache dir"
+  chmod 700 "$dir" 2>/dev/null || true
+  # These are only ever a staging area for one send; an abandoned paste should
+  # not sit in the cache for the rest of the session.
+  find "$dir" -maxdepth 1 -type f -mmin +60 -delete 2>/dev/null || true
+
+  local out
+  out="$dir/paste-$(date +%s).$ext"
+  wl-paste --type "$mime" > "$out" 2>/dev/null || { rm -f "$out"; emit_error "could not read the clipboard"; }
+  # Trust the bytes, not the advertised type — the same rule as for downloads.
+  case "$(file -b --mime-type "$out" 2>/dev/null || echo "")" in
+    image/png|image/jpeg) : ;;
+    *) rm -f "$out"; emit_error "no image on the clipboard" ;;
+  esac
+  jq -cn --arg p "$out" --arg n "$(basename -- "$out")" '{ok:true, path:$p, name:$n}'
+}
+
+
+# upload <channel> <path> [thread_ts] — share a local file, optional comment
+# on stdin. Slack's external-upload flow is three calls: ask for a signed URL,
+# POST the bytes to it, then tell Slack to attach the finished file to a
+# conversation.
+#
+# The path arrives from the UI — a clipboard image wl-paste wrote out, or a
+# dropped file — so it is never a shell word here (argv only, like every other
+# command) and is checked to be a readable regular file within Slack's own
+# size limit before anything is sent.
+cmd_upload() {
+  require_token
+  local id="${1:-}" path="${2:-}" thread_ts="${3:-}"
+  valid_channel "$id" || emit_error "bad channel id"
+  [[ -n "$thread_ts" ]] && { valid_ts "$thread_ts" || emit_error "bad thread ts"; }
+  [[ -f "$path" && -r "$path" ]] || emit_error "no such file"
+  local size name
+  size="$(stat -c %s "$path" 2>/dev/null || echo 0)"
+  (( size > 0 )) || emit_error "empty file"
+  (( size <= MAX_UPLOAD_BYTES )) || emit_error "file too large"
+  # Slack shows this name; keep it a plain basename so a crafted path cannot
+  # dress the upload up as something else in the conversation.
+  name="$(basename -- "$path")"
+  name="${name//[^A-Za-z0-9._-]/_}"
+  [[ -n "$name" ]] || name="upload"
+
+  local comment
+  comment="$(head -c "$MAX_MSG_CHARS")"
+
+  # 1. A signed, single-use URL to put the bytes at.
+  local res upload_url file_id
+  res="$(api_call files.getUploadURLExternal -G \
+    --data-urlencode "filename=$name" \
+    --data-urlencode "length=$size")" || emit_error "network error starting upload"
+  jq -e '.ok == true' <<<"$res" >/dev/null 2>&1 \
+    || emit_error "$(jq -r '.error // "upload failed"' <<<"$res" 2>/dev/null || echo "upload failed")"
+  upload_url="$(jq -r '.upload_url // ""' <<<"$res")"
+  file_id="$(jq -r '.file_id // ""' <<<"$res")"
+  valid_file "$file_id" || emit_error "upload failed"
+  # Slack hands us this URL; it still has to be one of Slack's own hosts over
+  # https before we POST a file of the user's to it.
+  [[ "$upload_url" =~ ^https://[a-z0-9.-]+\.slack\.com/ ]] || emit_error "upload failed"
+
+  # 2. The bytes. No Authorization header: the URL is itself the credential,
+  # and sending the token to a host Slack named would be handing it over.
+  # The file rides in on stdin, not inside the -F value: curl gives `;` and
+  # `,` meaning there, and a dropped path can contain either.
+  "${CURL[@]}" --max-time 120 -o /dev/null -w '%{http_code}' \
+    -X POST -F "file=@-;filename=$name" "$upload_url" < "$path" \
+    | grep -qE '^2[0-9][0-9]$' || emit_error "upload failed"
+
+  # 3. Attach it to the conversation.
+  local body
+  body="$(jq -cn --arg fid "$file_id" --arg n "$name" --arg ch "$id" \
+                 --arg tt "$thread_ts" --arg c "$comment" '
+    {files: [{id: $fid, title: $n}], channel_id: $ch}
+    + (if $tt != "" then {thread_ts: $tt} else {} end)
+    + (if ($c | gsub("\\s"; "")) != "" then {initial_comment: $c} else {} end)')"
+  res="$(printf '%s' "$body" \
+    | api_call files.completeUploadExternal -X POST \
+        -H 'Content-Type: application/json; charset=utf-8' --data-binary @-)" \
+    || emit_error "network error finishing upload"
+
+  jq -c --arg t "$TEAM_ID" \
+    '{ok:.ok, error:(.error // ""), ts:((.files[0].timestamp // "") | tostring), team_id:$t}' \
+    <<<"$res" 2>/dev/null || emit_error "unexpected reply"
+  if jq -e '.ok == true' <<<"$res" >/dev/null 2>&1; then
+    rm -f "$TEAM_CACHE/hist-$id.json"
+    [[ -n "$thread_ts" ]] && rm -f "$TEAM_CACHE/thread-$id-$thread_ts.json"
+  fi
+  exit 0
 }
 
 # ----------------------------------------------------------------------- send
@@ -1325,6 +1484,9 @@ case "${1:-}" in
   history)         shift; cmd_history "$@" ;;
   thread)          shift; cmd_thread "$@" ;;
   send)            shift; cmd_send "$@" ;;
+  upload)          shift; cmd_upload "$@" ;;
+  clip-image)      cmd_clip_image ;;
+  file-full)       shift; cmd_file_full "$@" ;;
   seen)            shift; cmd_seen "$@" ;;
   presence)        shift; cmd_presence "$@" ;;
   snooze)          shift; cmd_snooze "$@" ;;

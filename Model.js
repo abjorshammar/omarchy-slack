@@ -59,6 +59,40 @@ function sendCommand(scriptDir, teamId, channelId, threadTs) {
   return a
 }
 
+// The original behind a thumbnail. The url came out of a history payload this
+// script produced; it is handed back and re-checked there, not trusted here.
+function fileFullCommand(scriptDir, teamId, fileId, url) {
+  return base(scriptDir, teamId).concat(["file-full", String(fileId), String(url)])
+}
+
+// Share a local file. The path is argv, never a shell word; the script
+// re-checks it is a readable regular file within Slack's size limit.
+function uploadCommand(scriptDir, teamId, channelId, path, threadTs) {
+  var a = base(scriptDir, teamId).concat(["upload", String(channelId), String(path)])
+  if (threadTs) a.push(String(threadTs))
+  return a
+}
+
+// Write whatever image is on the Wayland clipboard to a private file.
+function clipImageCommand(scriptDir) {
+  return ["bash", script(scriptDir), "clip-image"]
+}
+
+// A dropped file arrives as a file:// URL. Anything else — a dragged link, a
+// remote image — is not a local file and there is nothing to upload.
+function dropPath(u) {
+  var s = String(u || "")
+  if (s.indexOf("file://") !== 0) return ""
+  var p = decodeURIComponent(s.substring(7))
+  return (p.charAt(0) === "/" && p.indexOf("\u0000") < 0) ? p : ""
+}
+
+function baseName(p) {
+  var s = String(p || "")
+  var i = s.lastIndexOf("/")
+  return i >= 0 ? s.substring(i + 1) : s
+}
+
 function threadCommand(scriptDir, teamId, channelId, ts) {
   return base(scriptDir, teamId).concat(["thread", String(channelId), String(ts)])
 }
@@ -302,11 +336,23 @@ function userAvatar(users, id) {
 // remote is ever accepted here — files.slack.com needs an auth header Image
 // cannot send, so a path is the only thing that can actually render.
 function validFilePath(x) {
-  return /\/omarchy-slack\/[TE][A-Z0-9]+\/files\/F[A-Z0-9]+\.(jpg|png)$/.test(String(x || ""))
+  // "-full" is the original fetched for the full-window view, beside the
+  // thumbnail shown in the message list.
+  return /\/omarchy-slack\/[TE][A-Z0-9]+\/files\/F[A-Z0-9]+(-full)?\.(jpg|png)$/.test(String(x || ""))
 }
 
 function fileSource(x) {
   return validFilePath(x) ? "file://" + String(x) : ""
+}
+
+// The local echo of an image just sent. This path is the one the user chose —
+// pasted or dropped — and never comes from Slack, so it is not the same trust
+// boundary validFilePath guards: an absolute path to something with an image
+// extension is enough. Nothing renders it but this session, and the real
+// thumbnail replaces it on the next history refresh.
+function localImageSource(x) {
+  var s = String(x || "")
+  return /^\/[^\0]+\.(jpg|jpeg|png|gif|webp)$/i.test(s) ? "file://" + s : ""
 }
 
 // "204 KB" / "1.4 MB" — what the row shows when there is no local image.
@@ -329,6 +375,8 @@ function messageFiles(m) {
       name: String(f.name || "file"),
       size: fileSize(f.size),
       path: fileSource(f.path),
+      // Where the original lives, so the full-window view can ask for it.
+      full: String(f.full || ""),
       // Slack gives the thumbnail's own dimensions; they keep the image from
       // jumping as it loads and cap how tall one attachment can get.
       w: parseInt(f.w, 10) || 0,
@@ -568,6 +616,11 @@ if (typeof module !== "undefined") {
     countsCommand: countsCommand,
     countsAllCommand: countsAllCommand,
     countsCachedCommand: countsCachedCommand,
+    uploadCommand: uploadCommand,
+    fileFullCommand: fileFullCommand,
+    clipImageCommand: clipImageCommand,
+    dropPath: dropPath,
+    baseName: baseName,
     workspacesCommand: workspacesCommand,
     useCommand: useCommand,
     historyCommand: historyCommand,
@@ -603,6 +656,7 @@ if (typeof module !== "undefined") {
     validAvatar: validAvatar,
     validFilePath: validFilePath,
     fileSource: fileSource,
+    localImageSource: localImageSource,
     fileSize: fileSize,
     messageFiles: messageFiles,
     avatarSource: avatarSource,

@@ -76,6 +76,15 @@ respond() {
       else
         echo '{"ok":true,"user":{"id":"U2222222","name":"jane","real_name":"Jane Doe","profile":{"display_name":"jane.d","image_72":"https://ca.slack-edge.com/T1-U2-72.png","image_48":"http://insecure.example/x.png"}}}'
       fi ;;
+    files.getUploadURLExternal)
+      # A compromised or spoofed reply pointing the upload somewhere else.
+      if [[ -n "${FAKE_EVIL_UPLOAD_URL:-}" ]]; then
+        echo '{"ok":true,"upload_url":"https://files.slack.com.evil.example/upload/v1/X","file_id":"F0UPLOAD1"}'
+      else
+        echo '{"ok":true,"upload_url":"https://files.slack.com/upload/v1/ABC123","file_id":"F0UPLOAD1"}'
+      fi ;;
+    files.completeUploadExternal)
+      echo '{"ok":true,"files":[{"id":"F0UPLOAD1","title":"pic.png","timestamp":1755900500}]}' ;;
     users.getPresence) echo '{"ok":true,"presence":"active"}' ;;
     dnd.info)          echo '{"ok":true,"snooze_enabled":false}' ;;
     conversations.history)
@@ -83,7 +92,7 @@ respond() {
       echo '{"ok":true,"messages":[
         {"type":"message","ts":"1755900002.000200","user":"U2222222","text":"newest <b>bold</b> &amp; stuff","reply_count":2,"thread_ts":"1755900002.000200",
          "files":[
-           {"id":"F0AAAAAA1","name":"shot.png","mimetype":"image/png","size":206236,"thumb_360":"https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_360.png","thumb_360_w":141,"thumb_360_h":360},
+           {"id":"F0AAAAAA1","name":"shot.png","mimetype":"image/png","size":206236,"thumb_360":"https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_360.png","thumb_360_w":141,"thumb_360_h":360,"thumb_720":"https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_720.png","thumb_720_w":282,"thumb_720_h":720,"url_private":"https://files.slack.com/files-pri/T1-F0AAAAAA1/shot.png"},
            {"id":"F0BBBBBB2","name":"locked.png","mimetype":"image/png","size":1024,"thumb_360":"https://files.slack.com/files-tmb/T1-F0BBBBBB2/locked_360.png","thumb_360_w":100,"thumb_360_h":100},
            {"id":"F0CCCCCC3","name":"notes.pdf","mimetype":"application/pdf","size":9000,"thumb_360":"https://files.slack.com/files-tmb/T1-F0CCCCCC3/notes_360.png","thumb_360_w":80,"thumb_360_h":80}]},
         {"type":"message","ts":"1755900001.000100","user":"U1111111","text":"older message"}]}' ;;
@@ -109,6 +118,19 @@ handle_url() {
     https://*.slack-edge.com/*|https://secure.gravatar.com/*)
       # Avatar: emit a real, valid image so cache_avatar's magick convert works.
       if [[ -n "$out" ]]; then magick -size 8x8 xc:'#3366cc' "png:$out" 2>/dev/null || printf 'x' > "$out"; fi
+      return 0 ;;
+    https://files.slack.com/files-pri/*)
+      # The original. A different, larger PNG than the thumbnail, so the suite
+      # can tell which one it got — or, with FAKE_LOCKED_FULL, the HTML
+      # sign-in page a token without files:read is answered with.
+      [[ -n "$out" ]] || return 0
+      if [[ -n "${FAKE_LOCKED_FULL:-}" ]]; then printf '<html>Sign in</html>' > "$out"; return 0; fi
+      printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFElEQVR42mNk+M/AwMDAxMAAAA4AAwHnAaMAAAAASUVORK5CYII=' | base64 -d > "$out"
+      return 0 ;;
+    https://files.slack.com/upload/*)
+      # The signed PUT target. Record what was sent so the suite can prove the
+      # token is not handed to it, then answer 200 the way Slack does.
+      printf '%s\n' "UPLOAD: $u" >> "$CURL_LOG"
       return 0 ;;
     https://files.slack.com/*)
       # A real 1x1 PNG for the one file the token may read (base64, so this
@@ -156,6 +178,19 @@ for a in "$@"; do
   [[ "$prev" == "--data-binary" || "$prev" == "-d" ]] && body="$a"
   if [[ "$prev" == "-H" && "$a" == @* ]]; then f="${a#@}"; [[ -r "$f" ]] && hdr="$hdr$(cat "$f" 2>/dev/null)"; fi
   prev="$a"
+done
+for a in "$@"; do
+  case "$a" in
+    https://files.slack.com/files-pri/*)
+      printf '%s\n' "URL: $a" >> "$CURL_LOG"
+      if [[ -n "${FAKE_LOCKED_FULL:-}" ]]; then printf '<html>Sign in</html>' > "$outfile"; exit 0; fi
+      printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFElEQVR42mNk+M/AwMDAxMAAAA4AAwHnAaMAAAAASUVORK5CYII=' | base64 -d > "$outfile"
+      exit 0 ;;
+    https://files.slack.com/upload/*)
+      printf '%s\n' "UPLOAD: $a" >> "$CURL_LOG"
+      [[ -n "$hdr" ]] && printf '%s\n' "UPLOAD-AUTH: $hdr" >> "$CURL_LOG"
+      printf '200'; exit 0 ;;
+  esac
 done
 if [[ -n "$avurl" && -n "$outfile" ]]; then
   magick -size 8x8 xc:'#3366cc' "png:$outfile" 2>/dev/null || printf 'x' > "$outfile"; exit 0
@@ -323,7 +358,10 @@ FILES="$CACHE/$ACME/files"
 check "history keeps the files array" "$(jq -r '.messages[] | select(.ts=="1755900002.000200") | .files | length' <<<"$out")" "3"
 check "attachment carries its name" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | .name' <<<"$out")" "shot.png"
 check "attachment carries its size" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | .size' <<<"$out")" "206236"
-check "attachment carries thumbnail dimensions" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | "\(.w)x\(.h)"' <<<"$out")" "141x360"
+check "attachment carries thumbnail dimensions" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | "\(.w)x\(.h)"' <<<"$out")" "282x720"
+# The 720 thumbnail where Slack made one: it renders sharper in the message
+# list and it is all the full-window view has to work with.
+check "prefers the 720 thumbnail" "$(grep -c 'URL: https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_720' "$CURL_LOG")" "1"
 check "readable image cached locally" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | .path | test("/omarchy-slack/'"$ACME"'/files/F0AAAAAA1[.]png$")' <<<"$out")" "true"
 check "…and the file is really there" "$([ -s "$FILES/F0AAAAAA1.png" ] && echo yes)" "yes"
 check "…and it is 0600 like every other cache file" "$(stat -c %a "$FILES/F0AAAAAA1.png")" "600"
@@ -340,6 +378,31 @@ n_before="$(grep -c F0AAAAAA1 "$CURL_LOG" || true)"
 rm -f "$CACHE/$ACME"/hist-D0AAAAAA1.json
 run history D0AAAAAA1 >/dev/null
 check "a cached thumbnail is not downloaded twice" "$(grep -c F0AAAAAA1 "$CURL_LOG" || true)" "$n_before"
+
+# The original, fetched only when the full-window view is opened — most never
+# are, and they run to Slack's whole 25 MiB limit.
+check "the payload carries the original's url" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | .full' <<<"$out")" "https://files.slack.com/files-pri/T1-F0AAAAAA1/shot.png"
+check "the original is not fetched up front" "$(grep -c 'files-pri' "$CURL_LOG" || true)" "0"
+full="$(run file-full F0AAAAAA1 "https://files.slack.com/files-pri/T1-F0AAAAAA1/shot.png")"
+check "file-full ok" "$(jq -r '.ok' <<<"$full")" "true"
+check "…cached beside the thumbnail, not over it" "$(jq -r '.path' <<<"$full" | grep -c 'F0AAAAAA1-full[.]png$')" "1"
+check "…the thumbnail is still there" "$([ -s "$FILES/F0AAAAAA1.png" ] && echo yes)" "yes"
+check "…and it really is the bigger image" "$([ "$(stat -c %s "$FILES/F0AAAAAA1-full.png")" -gt "$(stat -c %s "$FILES/F0AAAAAA1.png")" ] && echo yes)" "yes"
+check "…0600 like every other cache file" "$(stat -c %a "$FILES/F0AAAAAA1-full.png")" "600"
+check "…and Model.js accepts the path" "$(command -v node >/dev/null 2>&1 && node -e 'var M=require(process.argv[1]);process.stdout.write(String(M.validFilePath(process.argv[2])))' "$HERE/../Model.js" "$(jq -r '.path' <<<"$full")" || echo true)" "true"
+n_before="$(grep -c 'files-pri' "$CURL_LOG" || true)"
+check "a second open is served from cache" "$(run file-full F0AAAAAA1 "https://files.slack.com/files-pri/T1-F0AAAAAA1/shot.png" | jq -r '.cached')" "true"
+check "…and fetched nothing" "$(grep -c 'files-pri' "$CURL_LOG" || true)" "$n_before"
+# The url comes back through the UI, so it is re-checked here rather than trusted.
+check "refuses a file url off files.slack.com" "$(run file-full F0AAAAAA1 'https://evil.example/x.png' | jq -r '.error')" "bad file url"
+check "refuses a bad file id" "$(run file-full 'not-an-id' 'https://files.slack.com/files-pri/x.png' | jq -r '.error')" "bad file id"
+rm -f "$FILES/F0AAAAAA1-full.png"
+# Same rule as everywhere: a token without files:read gets a 200 and an HTML
+# sign-in page, so the bytes decide, not the request having "worked".
+out2="$(FAKE_LOCKED_FULL=1 run file-full F0AAAAAA1 "https://files.slack.com/files-pri/T1-F0AAAAAA1/shot.png")"
+check "a sign-in page is not cached as the original" "$(jq -r '.error' <<<"$out2")" "not an image"
+check "…and left nothing behind" "$(compgen -G "$FILES/F0AAAAAA1-full.*" >/dev/null 2>&1 && echo yes || echo no)" "no"
+check "…nor any scratch file" "$(compgen -G "$FILES/.full.*" >/dev/null 2>&1 && echo yes || echo no)" "no"
 out="$(run history D0AAAAAA1)"
 n_before="$(grep -c conversations.history "$CURL_LOG")"
 out="$(run history D0AAAAAA1)"
@@ -387,6 +450,82 @@ out="$(printf '   \n' | run send D0AAAAAA1)"
 check "rejects blank message" "$(jq -r '.ok' <<<"$out")" "false"
 out="$(printf 'hi' | run send 'D0AAAAAA1;rm -rf /')"
 check "rejects hostile channel id" "$(jq -r '.ok' <<<"$out")" "false"
+
+# Upload: three calls — ask for a signed URL, POST the bytes there, tell Slack
+# to attach the result. The comment goes over stdin like every other message.
+echo "== upload"
+PIC="$WORK/pic.png"
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' | base64 -d > "$PIC"
+: > "$CURL_LOG"
+out="$(printf 'here you go' | run upload D0AAAAAA1 "$PIC")"
+check "upload ok" "$(jq -r '.ok' <<<"$out")" "true"
+check "upload names its workspace" "$(jq -r '.team_id' <<<"$out")" "$ACME"
+check "upload reports a ts" "$(jq -r '.ts' <<<"$out")" "1755900500"
+check "the bytes went to the signed url" "$(grep -c '^UPLOAD: https://files.slack.com/upload/' "$CURL_LOG")" "1"
+# The signed URL is the credential. Sending the token to a host Slack merely
+# named in a response would be handing the token over.
+check "the token is NOT sent to the upload url" "$(grep -c '^UPLOAD-AUTH:' "$CURL_LOG" || true)" "0"
+body="$(grep '^BODY: ' "$CURL_BODY_LOG" | tail -1 | sed 's/^BODY: //')"
+check "complete names the channel" "$(jq -r '.channel_id' <<<"$body")" "D0AAAAAA1"
+check "complete names the file" "$(jq -r '.files[0].id' <<<"$body")" "F0UPLOAD1"
+check "the comment rides along" "$(jq -r '.initial_comment' <<<"$body")" "here you go"
+check "no thread_ts when not threading" "$(jq -r 'has("thread_ts")' <<<"$body")" "false"
+out="$(printf '' | run upload D0AAAAAA1 "$PIC" 1755900002.000200)"
+body="$(grep '^BODY: ' "$CURL_BODY_LOG" | tail -1 | sed 's/^BODY: //')"
+check "threaded upload carries thread_ts" "$(jq -r '.thread_ts' <<<"$body")" "1755900002.000200"
+check "an empty comment is omitted" "$(jq -r 'has("initial_comment")' <<<"$body")" "false"
+# A send invalidates the cached history, or the image would not show for a minute.
+run history D0AAAAAA1 >/dev/null
+printf '' | run upload D0AAAAAA1 "$PIC" >/dev/null
+check "upload drops the stale history cache" "$([ -f "$CACHE/$ACME/hist-D0AAAAAA1.json" ] && echo yes || echo no)" "no"
+# Every argument is checked before anything leaves.
+check "rejects a missing file" "$(printf '' | run upload D0AAAAAA1 "$WORK/nope.png" | jq -r '.error')" "no such file"
+check "rejects a directory" "$(printf '' | run upload D0AAAAAA1 "$WORK" | jq -r '.error')" "no such file"
+check "rejects an empty file" "$(: > "$WORK/empty.png"; printf '' | run upload D0AAAAAA1 "$WORK/empty.png" | jq -r '.error')" "empty file"
+truncate -s 26M "$WORK/huge.png" 2>/dev/null   # sparse: instant, and stat reports 26 MiB
+check "rejects an oversized file" "$(printf '' | run upload D0AAAAAA1 "$WORK/huge.png" | jq -r '.error')" "file too large"
+check "…before anything was sent" "$(grep -c getUploadURLExternal "$CURL_LOG" || true)" "3"
+check "rejects a hostile channel id" "$(printf '' | run upload 'D0AAAAAA1;rm -rf /' "$PIC" | jq -r '.ok')" "false"
+check "rejects a bad thread ts" "$(printf '' | run upload D0AAAAAA1 "$PIC" 'not-a-ts' | jq -r '.ok')" "false"
+# The upload URL comes out of a Slack response. It still has to be one of
+# Slack's own hosts before a file of the user's is POSTed to it.
+: > "$CURL_LOG"
+out="$(printf '' | FAKE_EVIL_UPLOAD_URL=1 run upload D0AAAAAA1 "$PIC")"
+check "refuses an upload url off slack.com" "$(jq -r '.ok' <<<"$out")" "false"
+check "…and posted the file nowhere" "$(grep -c 'evil.example' "$CURL_LOG" || true)" "0"
+
+# clip-image: what makes "screenshot, then paste" work. There is no file
+# dialog on this desktop, so the clipboard is the primary way a file is
+# chosen. The advertised type is not trusted — the bytes are checked.
+echo "== clip-image"
+mkdir -p "$WORK/clip"
+clipstub() { # clipstub <types-listing> <payload-writer>
+  cat > "$WORK/clip/wl-paste" <<CLIP
+#!/bin/bash
+if [[ "\${1:-}" == "--list-types" ]]; then printf '%s\\n' $1; exit 0; fi
+$2
+CLIP
+  chmod +x "$WORK/clip/wl-paste"
+}
+PNG_B64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+
+clipstub "image/png" "printf '%s' '$PNG_B64' | base64 -d"
+out="$(PATH="$WORK/clip:$PATH" run clip-image)"
+check "clip-image ok" "$(jq -r '.ok' <<<"$out")" "true"
+check "…wrote a real file" "$([ -s "$(jq -r '.path' <<<"$out")" ] && echo yes)" "yes"
+check "…that is 0600" "$(stat -c %a "$(jq -r '.path' <<<"$out")")" "600"
+check "…inside our own cache dir" "$(jq -r '.path' <<<"$out" | grep -c '/omarchy-slack/outgoing/')" "1"
+check "…and it uploads" "$(printf '' | run upload D0AAAAAA1 "$(jq -r '.path' <<<"$out")" | jq -r '.ok')" "true"
+
+clipstub "text/plain" "printf 'just text'"
+check "text on the clipboard is not an image" "$(PATH="$WORK/clip:$PATH" run clip-image | jq -r '.error')" "no image on the clipboard"
+
+# The type says PNG, the bytes are HTML. Trusting the label would put an
+# arbitrary file in front of an image decoder — and then in a conversation.
+clipstub "image/png" "printf '<html>not an image</html>'"
+out="$(PATH="$WORK/clip:$PATH" run clip-image)"
+check "a lying clipboard type is rejected" "$(jq -r '.error' <<<"$out")" "no image on the clipboard"
+check "…and left nothing behind" "$(find "$CACHE/outgoing" -type f ! -name '*.png' ! -name '*.jpg' 2>/dev/null | wc -l)" "0"
 
 echo "== seen / presence / snooze"
 out="$(run seen D0AAAAAA1 1755900002.000200)"
@@ -923,6 +1062,13 @@ else
   printf '%s\n' "$TOK_ACME" | run set-token >/dev/null
   av="$(run counts | jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .avatar')"
   ok_av="$(node -e 'var M=require(process.argv[1]); process.stdout.write(String(M.validAvatar(process.argv[2])))' "$HERE/../Model.js" "$av")"
+  # The local echo of a just-sent image renders the file the user chose,
+  # which never comes from Slack — a different trust boundary from a path in
+  # a payload, so it has its own check.
+  check "an echo path renders" "$(node -e 'var M=require(process.argv[1]);process.stdout.write(M.localImageSource(process.argv[2]))' "$HERE/../Model.js" "$CACHE/outgoing/paste-1.png")" "file://$CACHE/outgoing/paste-1.png"
+  check "a relative echo path does not" "$(node -e 'var M=require(process.argv[1]);process.stdout.write(M.localImageSource(process.argv[2]))' "$HERE/../Model.js" "paste-1.png")" ""
+  check "a non-image echo path does not" "$(node -e 'var M=require(process.argv[1]);process.stdout.write(M.localImageSource(process.argv[2]))' "$HERE/../Model.js" "/etc/passwd")" ""
+  check "a remote echo path does not" "$(node -e 'var M=require(process.argv[1]);process.stdout.write(M.localImageSource(process.argv[2]))' "$HERE/../Model.js" "https://evil.example/x.png")" ""
   check "script's avatar path passes Model.validAvatar" "$ok_av" "true"
   src="$(node -e 'var M=require(process.argv[1]); process.stdout.write(M.avatarSource(process.argv[2]))' "$HERE/../Model.js" "$av")"
   check "avatar renders as a file:// url" "${src%%:*}" "file"

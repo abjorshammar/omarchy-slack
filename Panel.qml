@@ -97,6 +97,8 @@ Item {
   property int selectedMsg: -1
   property string flash: ""
   property bool showShortcuts: false
+  // The attachment currently shown full-window, as a file:// url. "" = none.
+  property string viewingImage: ""
 
   // Thread view: threadTs != "" means the message pane is showing a thread's
   // replies instead of the conversation root.
@@ -344,6 +346,10 @@ Item {
   }
 
   // Only ever hands http(s) URLs to the opener.
+  function openImage(src) {
+    if (String(src || "") !== "") viewingImage = String(src)
+  }
+
   function openUrl(u) {
     if (u && /^https?:\/\//i.test(String(u)))
       Quickshell.execDetached(["xdg-open", String(u)])
@@ -497,6 +503,7 @@ Item {
     // it always has — never argv.
     sendProc.pendingText = text
     sendProc.pendingFileName = pendingFile ? pendingFile.name : ""
+    sendProc.pendingFilePath = pendingFile ? pendingFile.path : ""
     sendProc.stdinEnabled = true
     sendProc.running = true
   }
@@ -509,7 +516,12 @@ Item {
     // conversation.
     if (sendProc.team !== activeTeam) return
     if (!data.ok) {
-      sendError = Model.friendlyError(data.error)
+      // Uploading needs files:write, and scopes are fixed at authorization —
+      // so for a workspace signed in before uploads existed the fix is not
+      // "see README", it is "sign out and back in".
+      sendError = (String(data.error) === "missing_scope" && sendProc.pendingFileName !== "")
+        ? "this workspace's token cannot upload — sign it out and back in (⚙) to grant it"
+        : Model.friendlyError(data.error)
       return
     }
     // Append locally instead of refetching — history is 1 request/minute.
@@ -525,10 +537,12 @@ Item {
       daySep: "",
       firstUnread: false,
       reactions: [],
-      // The name only: the real thumbnail arrives with the next history
-      // refresh, at most a minute out, and Slack has not made one yet.
+      // The file we just uploaded, straight off disk. Slack has not made a
+      // thumbnail yet, and waiting for one meant a sent image showed as a
+      // filename until the next history refresh — or a reload.
       files: sendProc.pendingFileName !== ""
-        ? [{ id: "", name: sendProc.pendingFileName, size: "", path: "", w: 0, h: 0 }]
+        ? [{ id: "", name: sendProc.pendingFileName, size: "",
+             path: Model.localImageSource(sendProc.pendingFilePath), w: 0, h: 0 }]
         : [],
       time: Qt.formatTime(new Date(), "HH:mm"),
       url: Model.firstUrl(sendProc.pendingText),
@@ -765,23 +779,35 @@ Item {
   Component {
     id: imageAttachment
     Item {
+      id: att
       property var file: ({ path: "", w: 0, h: 0, name: "" })
-      // Slack's thumbnail is at most 360 on its long edge; scale it down to
-      // fit the pane but never up, so a small image is not blurred.
-      readonly property real maxW: Math.min(width > 0 ? width : 320, 320)
-      readonly property real scale_: (file.w > 0 && file.h > 0)
-        ? Math.min(maxW / file.w, 320 / file.h, 1) : 1
-      implicitHeight: file.h > 0 ? Math.round(file.h * scale_) : 0
+      // Slack's dimensions are only a hint for before the image has loaded.
+      // The real ones come from the file itself, so a local echo of something
+      // just sent sizes correctly with no metadata at all.
+      readonly property real nw: img.implicitWidth > 0 ? img.implicitWidth : (file.w || 0)
+      readonly property real nh: img.implicitHeight > 0 ? img.implicitHeight : (file.h || 0)
+      // Scaled down to fit the pane, never up: a small image stays sharp.
+      readonly property real box: Math.min(width > 0 ? width : 320, 320)
+      readonly property real k: (nw > 0 && nh > 0) ? Math.min(box / nw, 320 / nh, 1) : 0
+      implicitHeight: k > 0 ? Math.round(nh * k) : 0
 
       Image {
-        source: parent.file.path
-        width: parent.file.w > 0 ? Math.round(parent.file.w * parent.scale_) : 0
-        height: parent.implicitHeight
+        id: img
+        source: att.file.path
+        width: att.k > 0 ? Math.round(att.nw * att.k) : 0
+        height: att.implicitHeight
         fillMode: Image.PreserveAspectFit
         asynchronous: true
         // A cached image can be pruned out from under a stale payload; show
         // nothing rather than a broken-image box.
         visible: status === Image.Ready
+
+        MouseArea {
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.openImage(att.file.path)
+        }
       }
     }
   }
@@ -850,6 +876,7 @@ Item {
     id: sendProc
     property string pendingText: ""
     property string pendingFileName: ""
+    property string pendingFilePath: ""
     property string team: ""
     property bool intoThread: false
     property var cmd: ["true"]
@@ -968,7 +995,8 @@ Item {
           }
           var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
           if (event.key === Qt.Key_Escape) {
-            if (root.addingWorkspace) root.cancelAddWorkspace()
+            if (root.viewingImage !== "") root.viewingImage = ""
+            else if (root.addingWorkspace) root.cancelAddWorkspace()
             else if (root.threadTs !== "") root.closeThread()
             else if (inConvo) root.backToList()
             else root.dismiss()
@@ -2269,7 +2297,8 @@ Item {
               id: messageArea
               visible: !root.settingsMode && root.convo !== null
               width: parent.width
-              height: parent.height - Style.space(24) - composeRow.height - Style.space(24)
+              height: parent.height - Style.space(24) - composeRow.height
+                      - attachChip.height - sendErrorText.height - Style.space(24)
 
               // Drop a file anywhere over the conversation to stage it. The
               // other half of "there is no file dialog on this desktop"; only
@@ -2709,13 +2738,30 @@ Item {
               }
             }
 
+            // Why the last send did not go through. Above the compose box, not
+            // below it: below, it rendered past the bottom edge of the window
+            // and a failed send looked like nothing happening at all.
+            Text {
+              id: sendErrorText
+              textFormat: Text.PlainText
+              visible: !root.settingsMode && root.sendError !== ""
+              width: parent.width
+              height: visible ? implicitHeight : 0
+              text: "⚠ " + root.sendError
+              color: Color.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
             // What is staged for the next send. Clicking ✕ drops it; sending
             // clears it. Kept above the compose box so it is impossible to
             // send an attachment without having seen that it is attached.
             Rectangle {
+              id: attachChip
               visible: !root.settingsMode && root.convo !== null && root.pendingFile !== null
+              height: visible ? chipRow.implicitHeight + Style.space(8) : 0
               width: chipRow.implicitWidth + Style.space(14)
-              height: chipRow.implicitHeight + Style.space(8)
               radius: root.cornerRadius
               color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.14)
               border.width: 1
@@ -2821,16 +2867,6 @@ Item {
               }
             }
 
-            Text {
-              textFormat: Text.PlainText
-              visible: !root.settingsMode && root.sendError !== ""
-              width: parent.width
-              text: "⚠ " + root.sendError
-              color: Color.urgent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
           }
         }
 
@@ -2853,6 +2889,51 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             font.bold: true
+          }
+        }
+
+        // ---- full-window image viewer ----
+        // Click an attachment to fill the window with it; click anywhere (or
+        // Esc) to close. Scaled down to fit, never up — a thumbnail blown
+        // past its own resolution just looks worse than it is.
+        Rectangle {
+          id: imageViewer
+          visible: root.viewingImage !== ""
+          anchors.fill: parent
+          z: 100
+          color: Qt.rgba(root.background.r, root.background.g, root.background.b, 0.94)
+
+          readonly property real box_w: width - Style.space(48)
+          readonly property real box_h: height - Style.space(48)
+          readonly property real k: (bigImage.implicitWidth > 0 && bigImage.implicitHeight > 0)
+            ? Math.min(box_w / bigImage.implicitWidth, box_h / bigImage.implicitHeight, 1) : 0
+
+          Image {
+            id: bigImage
+            anchors.centerIn: parent
+            source: root.viewingImage
+            width: imageViewer.k > 0 ? Math.round(implicitWidth * imageViewer.k) : 0
+            height: imageViewer.k > 0 ? Math.round(implicitHeight * imageViewer.k) : 0
+            fillMode: Image.PreserveAspectFit
+            asynchronous: true
+            visible: status === Image.Ready
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: Style.space(16)
+            text: "click anywhere to close"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.viewingImage = ""
           }
         }
 

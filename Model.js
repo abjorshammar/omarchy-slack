@@ -337,6 +337,16 @@ function fileSource(x) {
   return validFilePath(x) ? "file://" + String(x) : ""
 }
 
+// The local echo of an image just sent. This path is the one the user chose —
+// pasted or dropped — and never comes from Slack, so it is not the same trust
+// boundary validFilePath guards: an absolute path to something with an image
+// extension is enough. Nothing renders it but this session, and the real
+// thumbnail replaces it on the next history refresh.
+function localImageSource(x) {
+  var s = String(x || "")
+  return /^\/[^\0]+\.(jpg|jpeg|png|gif|webp)$/i.test(s) ? "file://" + s : ""
+}
+
 // "204 KB" / "1.4 MB" — what the row shows when there is no local image.
 function fileSize(bytes) {
   var n = parseInt(bytes, 10) || 0
@@ -635,6 +645,7 @@ if (typeof module !== "undefined") {
     validAvatar: validAvatar,
     validFilePath: validFilePath,
     fileSource: fileSource,
+    localImageSource: localImageSource,
     fileSize: fileSize,
     messageFiles: messageFiles,
     avatarSource: avatarSource,

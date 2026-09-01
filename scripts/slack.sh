@@ -1117,8 +1117,12 @@ cmd_history() {
        files: [((.files // [])[]) | {
          id: (.id // ""), name: ((.name // "") | .[0:120]),
          mime: (.mimetype // ""), size: (.size // 0),
-         w: (.thumb_360_w // 0), h: (.thumb_360_h // 0),
-         url: (.thumb_360 // "")}],
+         # 720 where Slack made one: it is still a small file, it renders
+         # sharper than a 360 scaled to the same box, and it is what the
+         # full-window view has to work with.
+         w: (.thumb_720_w // .thumb_360_w // 0),
+         h: (.thumb_720_h // .thumb_360_h // 0),
+         url: (.thumb_720 // .thumb_360 // "")}],
        text: ((.text // "") | .[0:8000])}] | reverse' <<<"$res")"
   msgs="$(attach_files "$msgs")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"
@@ -1175,8 +1179,12 @@ cmd_thread() {
        files: [((.files // [])[]) | {
          id: (.id // ""), name: ((.name // "") | .[0:120]),
          mime: (.mimetype // ""), size: (.size // 0),
-         w: (.thumb_360_w // 0), h: (.thumb_360_h // 0),
-         url: (.thumb_360 // "")}],
+         # 720 where Slack made one: it is still a small file, it renders
+         # sharper than a 360 scaled to the same box, and it is what the
+         # full-window view has to work with.
+         w: (.thumb_720_w // .thumb_360_w // 0),
+         h: (.thumb_720_h // .thumb_360_h // 0),
+         url: (.thumb_720 // .thumb_360 // "")}],
        text: ((.text // "") | .[0:8000])}]' <<<"$res")"
   msgs="$(attach_files "$msgs")"
   uids="$(jq -c '[.[] | .user | select(. != "")]' <<<"$msgs")"

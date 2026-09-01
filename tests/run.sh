@@ -92,7 +92,7 @@ respond() {
       echo '{"ok":true,"messages":[
         {"type":"message","ts":"1755900002.000200","user":"U2222222","text":"newest <b>bold</b> &amp; stuff","reply_count":2,"thread_ts":"1755900002.000200",
          "files":[
-           {"id":"F0AAAAAA1","name":"shot.png","mimetype":"image/png","size":206236,"thumb_360":"https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_360.png","thumb_360_w":141,"thumb_360_h":360},
+           {"id":"F0AAAAAA1","name":"shot.png","mimetype":"image/png","size":206236,"thumb_360":"https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_360.png","thumb_360_w":141,"thumb_360_h":360,"thumb_720":"https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_720.png","thumb_720_w":282,"thumb_720_h":720},
            {"id":"F0BBBBBB2","name":"locked.png","mimetype":"image/png","size":1024,"thumb_360":"https://files.slack.com/files-tmb/T1-F0BBBBBB2/locked_360.png","thumb_360_w":100,"thumb_360_h":100},
            {"id":"F0CCCCCC3","name":"notes.pdf","mimetype":"application/pdf","size":9000,"thumb_360":"https://files.slack.com/files-tmb/T1-F0CCCCCC3/notes_360.png","thumb_360_w":80,"thumb_360_h":80}]},
         {"type":"message","ts":"1755900001.000100","user":"U1111111","text":"older message"}]}' ;;
@@ -345,7 +345,10 @@ FILES="$CACHE/$ACME/files"
 check "history keeps the files array" "$(jq -r '.messages[] | select(.ts=="1755900002.000200") | .files | length' <<<"$out")" "3"
 check "attachment carries its name" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | .name' <<<"$out")" "shot.png"
 check "attachment carries its size" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | .size' <<<"$out")" "206236"
-check "attachment carries thumbnail dimensions" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | "\(.w)x\(.h)"' <<<"$out")" "141x360"
+check "attachment carries thumbnail dimensions" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | "\(.w)x\(.h)"' <<<"$out")" "282x720"
+# The 720 thumbnail where Slack made one: it renders sharper in the message
+# list and it is all the full-window view has to work with.
+check "prefers the 720 thumbnail" "$(grep -c 'URL: https://files.slack.com/files-tmb/T1-F0AAAAAA1/shot_720' "$CURL_LOG")" "1"
 check "readable image cached locally" "$(jq -r '.messages[] | .files[]? | select(.id=="F0AAAAAA1") | .path | test("/omarchy-slack/'"$ACME"'/files/F0AAAAAA1[.]png$")' <<<"$out")" "true"
 check "…and the file is really there" "$([ -s "$FILES/F0AAAAAA1.png" ] && echo yes)" "yes"
 check "…and it is 0600 like every other cache file" "$(stat -c %a "$FILES/F0AAAAAA1.png")" "600"
@@ -1021,6 +1024,13 @@ else
   printf '%s\n' "$TOK_ACME" | run set-token >/dev/null
   av="$(run counts | jq -r '.conversations[] | select(.id=="D0AAAAAA1") | .avatar')"
   ok_av="$(node -e 'var M=require(process.argv[1]); process.stdout.write(String(M.validAvatar(process.argv[2])))' "$HERE/../Model.js" "$av")"
+  # The local echo of a just-sent image renders the file the user chose,
+  # which never comes from Slack — a different trust boundary from a path in
+  # a payload, so it has its own check.
+  check "an echo path renders" "$(node -e 'var M=require(process.argv[1]);process.stdout.write(M.localImageSource(process.argv[2]))' "$HERE/../Model.js" "$CACHE/outgoing/paste-1.png")" "file://$CACHE/outgoing/paste-1.png"
+  check "a relative echo path does not" "$(node -e 'var M=require(process.argv[1]);process.stdout.write(M.localImageSource(process.argv[2]))' "$HERE/../Model.js" "paste-1.png")" ""
+  check "a non-image echo path does not" "$(node -e 'var M=require(process.argv[1]);process.stdout.write(M.localImageSource(process.argv[2]))' "$HERE/../Model.js" "/etc/passwd")" ""
+  check "a remote echo path does not" "$(node -e 'var M=require(process.argv[1]);process.stdout.write(M.localImageSource(process.argv[2]))' "$HERE/../Model.js" "https://evil.example/x.png")" ""
   check "script's avatar path passes Model.validAvatar" "$ok_av" "true"
   src="$(node -e 'var M=require(process.argv[1]); process.stdout.write(M.avatarSource(process.argv[2]))' "$HERE/../Model.js" "$av")"
   check "avatar renders as a file:// url" "${src%%:*}" "file"
